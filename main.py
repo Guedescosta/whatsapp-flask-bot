@@ -1,33 +1,45 @@
 from flask import Flask, request, jsonify
-import os
 import requests
 
-app = Flask(name)
+app = Flask(__name__)
 
-ZAPI_INSTANCE_ID = os.environ.get("ZAPI_INSTANCE_ID") ZAPI_TOKEN = os.environ.get("ZAPI_TOKEN")
+# VARIÁVEIS FIXAS (caso deseje, substitua por os.environ.get() para ambiente seguro)
+ZAPI_INSTANCE_ID = "3DFAED34CAF760CDDF170A1EFCACDE10"
+ZAPI_TOKEN = "97DAA07311ACEFFA36DF23AF"
 
-@app.route("/", methods=["GET"]) def index(): return "Bot do WhatsApp está rodando! ✅"
+@app.route('/', methods=['GET'])
+def home():
+    return '✅ Bot do WhatsApp está rodando!'
 
-@app.route("/", methods=["POST"]) def whatsapp_webhook(): data = request.get_json()
+@app.route('/', methods=['POST'])
+def receber_mensagem():
+    dados = request.get_json()
 
-if not data:
-    return jsonify({"error": "Nenhum dado recebido"}), 400
+    try:
+        mensagem = dados['message']['text']['body']
+        numero = dados['message']['from']
+    except (KeyError, TypeError):
+        return jsonify({'status': 'mensagem ignorada'}), 200
 
-message = data.get("message", {})
-sender = message.get("from")
-text = message.get("text", {}).get("body")
+    resposta = gerar_resposta(mensagem)
 
-if sender and text:
-    resposta = f"Recebido: {text}"
-    url = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_TOKEN}/send-text"
+    url = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_TOKEN}/send-messages"
     payload = {
-        "phone": sender,
-        "message": resposta
+        "messages": [{
+            "to": numero,
+            "type": "text",
+            "text": {"body": resposta}
+        }]
     }
-    headers = {"Content-Type": "application/json"}
-    requests.post(url, json=payload, headers=headers)
 
-return jsonify({"status": "Mensagem processada"})
+    requests.post(url, json=payload)
+    return jsonify({'status': 'mensagem enviada'}), 200
 
-if name == "main": port = int(os.environ.get("PORT", 5000)) app.run(host="0.0.0.0", port=port)
+def gerar_resposta(texto):
+    texto = texto.strip().lower()
+    if texto == 'oi':
+        return "Olá! 👋 Como posso te ajudar hoje?"
+    return f"Você disse: {texto}"
 
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=10000)
