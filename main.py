@@ -14,24 +14,23 @@ def home():
 @app.route("/", methods=["POST"])
 def webhook():
     print("🔔 Requisição recebida via webhook.")
+    
     try:
         data = request.get_json()
         print("📦 Dados recebidos:", data)
 
-        # Tenta extrair de message["text"]["body"] (modelo antigo)
-        text = None
-        phone = None
-        if "message" in data:
-            message = data["message"]
-            phone = message.get("from")
-            text = message.get("text", {}).get("body")
-        else:
-            # Novo modelo (chatId + text)
-            phone = data.get("chatId", "").replace("@c.us", "")
-            text = data.get("text")
+        message = data.get("message", {})
+        phone = message.get("from")
+        # Tenta pegar o texto diretamente do campo 'text', ou do campo 'body'
+        text = (
+            message.get("text", {}).get("body") or
+            message.get("body") or
+            message.get("text") or
+            ""
+        )
 
-        if not phone or not text:
-            print("⚠️ Número de telefone ou texto ausente.")
+        if not phone or not text.strip():
+            print("⚠️ Número do telefone ou texto ausente.")
             return jsonify({"status": "no-action"}), 200
 
         print(f"📨 Mensagem recebida de {phone}: {text}")
