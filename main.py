@@ -4,29 +4,30 @@ import requests
 
 app = Flask(__name__)
 
-# Tokens da Z-API (devem estar configurados nas variáveis de ambiente no Render)
-INSTANCE_ID = os.getenv("INSTANCE_ID")
-TOKEN = os.getenv("TOKEN")
+INSTANCE_ID = os.getenv("ZAPI_ID")
+TOKEN = os.getenv("ZAPI_TOKEN")
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot do WhatsApp está rodando! ✅"
+    return "Bot do WhatsApp está rodando com sucesso! ✅", 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    data = request.get_json()
 
     try:
-        message = data['message']['text']['body']
-        number = data['message']['from']
+        sender = data["message"]["from"]
+        msg = data["message"]["text"]["body"]
 
-        resposta = f"Olá! Recebemos sua mensagem: \"{message}\""
-        send_message(number, resposta)
+        print(f"Mensagem de {sender}: {msg}")
+
+        resposta = f"Olá! Recebemos sua mensagem: \"{msg}\". Em breve entraremos em contato 😊"
+        send_message(sender, resposta)
 
     except Exception as e:
-        print("Erro no webhook:", e)
+        print("Erro ao processar mensagem:", e)
 
-    return jsonify({"status": "mensagem processada"}), 200
+    return jsonify({"status": "recebido"}), 200
 
 def send_message(phone, message):
     url = f"https://api.z-api.io/instances/{INSTANCE_ID}/token/{TOKEN}/send-text"
@@ -38,8 +39,9 @@ def send_message(phone, message):
         "Content-Type": "application/json"
     }
 
-    r = requests.post(url, json=payload, headers=headers)
-    print("Resposta da Z-API:", r.text)
+    response = requests.post(url, json=payload, headers=headers)
+    print("Resposta da Z-API:", response.text)
 
 if __name__ == "__main__":
-    app.run()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
