@@ -9,31 +9,30 @@ ZAPI_TOKEN = os.environ.get("ZAPI_TOKEN")
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot do WhatsApp está rodando! ✅"
+    return "🤖 Bot do WhatsApp está rodando! ✅"
 
 @app.route("/", methods=["POST"])
 def webhook():
-    print("📬 Webhook recebido!")
+    print("🔔 Webhook recebido!")
 
     try:
         data = request.get_json()
         print("📦 Dados brutos recebidos:", data)
 
-        message = data.get("message", {})
-        phone = message.get("from", None)
+        if not data or "message" not in data:
+            print("⚠️ Payload inválido.")
+            return jsonify({"status": "ignored"}), 200
 
-        # Tentativa segura de obter o texto da mensagem
-        text_data = message.get("text", {})
-        text = text_data.get("message") or text_data.get("body")
+        message = data["message"]
+        phone = message.get("phone")  # Correto para Z-API
+        text = message.get("text", {}).get("message")  # Correto para Z-API
 
-        print(f"🔎 Telefone: {phone}")
-        print(f"🔎 Texto: {text}")
+        print(f"📥 Telefone: {phone}")
+        print(f"📝 Texto: {text}")
 
         if not phone or not text:
             print("⚠️ Telefone ou texto ausente na mensagem recebida.")
             return jsonify({"status": "no-action"}), 200
-
-        print(f"📨 Mensagem recebida de {phone}: {text}")
 
         resposta = "Olá! Recebemos sua mensagem e em breve retornaremos. 😊"
 
@@ -43,7 +42,7 @@ def webhook():
             "message": resposta
         }
 
-        print("📤 Enviando resposta...")
+        print("➡️ Enviando resposta para Z-API...")
         response = requests.post(url, json=payload)
         print("✅ Resposta da API:", response.text)
 
