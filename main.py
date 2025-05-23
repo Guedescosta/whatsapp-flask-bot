@@ -3,7 +3,7 @@ import os
 import requests
 import logging
 
-# → Configuração de logging
+# ─── Setup básico de logging ────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s — %(message)s"
@@ -11,40 +11,44 @@ logging.basicConfig(
 
 app = Flask(__name__)
 
-# → Variáveis de ambiente para Z-API
+# ─── Configuração da Z-API via ENV ─────────────────────────────────────────
 ZAPI_INSTANCE_ID = os.environ.get("ZAPI_INSTANCE_ID")
 ZAPI_TOKEN       = os.environ.get("ZAPI_TOKEN")
 
-def parse_webhook(data: dict):
+# ─── Função de Parsing do Webhook ───────────────────────────────────────────
+def parse_zapi_payload(data: dict):
     """
-    Tenta extrair (phone, text) de diferentes formatos de payload Z-API.
+    Tenta extrair (phone, text) de diferentes formatos de payload da Z-API.
     Retorna (phone, text) ou (None, None) se não encontrar.
     """
-    # 1) Formato antigo com chave 'message'
+    # 1) Quando vem dentro de "message": { "from":..., "text": { "body" } }
     if "message" in data and isinstance(data["message"], dict):
         msg = data["message"]
         phone = msg.get("from")
-        text_field = msg.get("text", {})
-        if isinstance(text_field, dict):
-            # pode vir em 'body' ou 'message'
-            return phone, text_field.get("body") or text_field.get("message")
-    # 2) Formato direto com 'text' no root
+        txt = msg.get("text", {})
+        if isinstance(txt, dict):
+            return phone, txt.get("body") or txt.get("message")
+
+    # 2) Quando o webhook envia no root: "text": { "message":... }
     if "text" in data and isinstance(data["text"], dict):
-        phone = data.get("from")
-        return phone, data["text"].get("body") or data["text"].get("message")
-    # 3) Payload tipo RECEIVED (ReceivedCallback)
-    if data.get("type") and data["type"].lower().startswith("received"):
         phone = data.get("from") or data.get("phone")
-        text_field = data.get("text", {})
-        if isinstance(text_field, dict):
-            return phone, text_field.get("message") or text_field.get("body")
-    # → não reconheceu
+        return phone, data["text"].get("body") or data["text"].get("message")
+
+    # 3) Tipo ReceivedCallback (status='RECEIVED')
+    t = data.get("type", "")
+    if isinstance(t, str) and t.lower().startswith("received"):
+        phone = data.get("from") or data.get("phone")
+        txt = data.get("text", {})
+        if isinstance(txt, dict):
+            return phone, txt.get("message") or txt.get("body")
+
+    # não reconheceu
     return None, None
 
-def send_whatsapp(phone: str, message: str):
-    """Envia mensagem via Z-API e retorna (sucesso, detalhe)."""
+# ─── Função de Envio para a Z-API ───────────────────────────────────────────
+def send_to_zapi(phone: str, message: str):
     if not ZAPI_INSTANCE_ID or not ZAPI_TOKEN:
-        return False, "Configuração de Z-API ausente"
+        return False, "Z-API não configurada (env vars ausentes)"
 
     url = (
         f"https://api.z-api.io/instances/"
@@ -60,37 +64,40 @@ def send_whatsapp(phone: str, message: str):
     except requests.exceptions.RequestException as e:
         return False, str(e)
 
+# ─── Rota de Healthcheck ───────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def healthcheck():
-    return "✅ Bot do WhatsApp está rodando com sucesso!", 200
+    return "✅ Bot do WhatsApp está rodando!", 200
 
-@app.route("/", methods=["POST"])
+# ─── Rota de Webhook ────────────────────────────────────────────────────────
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    logging.info("📩 Webhook recebido")
+    logging.info("📩 Webhook recebido em /webhook")
     data = request.get_json(silent=True)
     if not data:
-        logging.warning("⚠️ Payload vazio ou JSON inválido")
+        logging.warning("⚠️ JSON inválido ou vazio")
         return jsonify({"status": "error", "detail": "JSON inválido"}), 400
 
     logging.info(f"📦 Payload bruto: {data}")
-    phone, text = parse_webhook(data)
+    phone, text = parse_zapi_payload(data)
     if not phone or not text:
-        logging.warning("⚠️ Estrutura de payload não reconhecida ou sem telefone/texto")
+        logging.warning("⚠️ Payload sem telefone/texto conhecido → ignorando")
         return jsonify({"status": "ignored"}), 200
 
-    logging.info(f"📞 Telefone: {phone}  |  ✉️ Texto: {text}")
+    logging.info(f"📞 De: {phone}  |  ✉️ Msg: {text}")
 
-    # → Aqui você pode melhorar: NLU, intenções, etc.
-    resposta = "Olá! Recebemos sua mensagem e logo retornamos. 🙂"
+    # resposta estática (você pode criar lógica de intenções aqui)
+    resposta = "Olá! Recebemos sua mensagem e logo retornaremos. 🙂"
 
-    success, detail = send_whatsapp(phone, resposta)
+    success, detail = send_to_zapi(phone, resposta)
     if success:
-        logging.info(f"✅ Mensagem enviada: {detail}")
+        logging.info(f"✅ Enviado para {phone}: {detail}")
         return jsonify({"status": "message sent"}), 200
     else:
-        logging.error(f"❌ Erro ao enviar: {detail}")
+        logging.error(f"❌ Falha ao enviar para {phone}: {detail}")
         return jsonify({"status": "error", "detail": detail}), 500
 
+# ─── Entrada ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     logging.info(f"🚀 Iniciando na porta {port}")
