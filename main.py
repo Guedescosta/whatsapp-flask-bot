@@ -4,80 +4,58 @@ import requests
 
 app = Flask(__name__)
 
-# variáveis de ambiente que você deve ter configurado
-INSTANCE_ID     = os.environ["ZAPI_INSTANCE_ID"]
-INSTANCE_TOKEN  = os.environ["ZAPI_TOKEN"]
-CLIENT_TOKEN    = os.environ["ZAPI_CLIENT_TOKEN"]
-
-API_URL = (
-    f"https://api.z-api.io/instances/"
-    f"{INSTANCE_ID}/token/{INSTANCE_TOKEN}/send-text"
-)
+ZAPI_INSTANCE_ID = os.environ.get("ZAPI_INSTANCE_ID")
+ZAPI_TOKEN = os.environ.get("ZAPI_TOKEN")
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot do WhatsApp está rodando! ✅"
+    return "✅ Bot do WhatsApp está rodando com sucesso!"
 
 @app.route("/", methods=["POST"])
 def webhook():
+    print("📩 Webhook recebido!")
+
     try:
-        data = request.get_json(force=True)
-        app.logger.info("🔔 Webhook recebido: %s", data)
+        data = request.get_json()
+        print("📦 Dados brutos recebidos:", data)
 
-        # extrai telefone e texto de ambos os formatos possíveis
-        phone = None
-        text  = None
-
-        if "phone" in data and "text" in data:
-            phone = data["phone"]
-            t = data["text"]
-            # costuma vir { "message": "texto aqui" }
-            if isinstance(t, dict):
-                text = t.get("message") or t.get("body")
-            else:
-                text = str(t)
-
-        elif "message" in data:
-            msg = data["message"]
-            phone = msg.get("from") or msg.get("phone")
-            t = msg.get("text", {})
-            if isinstance(t, dict):
-                text = t.get("body") or t.get("message")
-            else:
-                text = str(t)
-
-        else:
-            app.logger.warning("❌ Payload não reconhecido, ignorando.")
+        # Verifica se a chave 'message' existe corretamente
+        if not data or "message" not in data or "text" not in data["message"]:
+            print("⚠️ Payload inválido (sem 'message')")
             return jsonify({"status": "ignored"}), 200
 
+        message = data["message"]
+        phone = message.get("from")
+        text = message["text"].get("message")  # Aqui é 'message' dentro de 'text', como confirmado no JSON da Z-API
+
+        print("📞 Telefone:", phone)
+        print("✉️ Texto:", text)
+
         if not phone or not text:
-            app.logger.warning("⚠️ Telefone ou texto ausente. phone=%s text=%s", phone, text)
+            print("⚠️ Telefone ou texto ausente na mensagem recebida.")
             return jsonify({"status": "no-action"}), 200
 
-        app.logger.info("📨 Mensagem de %s: %s", phone, text)
+        print(f"📬 Mensagem de {phone}: {text}")
 
-        # monta o payload de resposta
-        resposta = "Olá! Recebemos sua mensagem e em breve retornaremos. 😊"
-        payload = {"phone": phone, "message": resposta}
+        resposta = "Olá! 👋 Recebemos sua mensagem e em breve retornaremos."
 
-        # cabeçalhos obrigatórios
+        url = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_TOKEN}/send-text"
+        payload = {
+            "phone": phone,
+            "message": resposta
+        }
         headers = {
-            "Client-Token": CLIENT_TOKEN,
             "Content-Type": "application/json"
         }
 
-        app.logger.info("➡️ Enviando resposta: %s", payload)
-        resp = requests.post(API_URL, json=payload, headers=headers, timeout=10)
-        resp.raise_for_status()
-        app.logger.info("✅ Resposta da Z-API: %s", resp.json())
+        print("📤 Enviando resposta via Z-API...")
+        response = requests.post(url, json=payload, headers=headers)
+        print("✅ Resposta da Z-API:", response.text)
 
         return jsonify({"status": "message sent"}), 200
 
-    except requests.HTTPError as e:
-        app.logger.error("❌ Erro ao enviar resposta: %s", e)
-        return jsonify({"status": "error", "detail": str(e)}), 500
     except Exception as e:
-        app.logger.exception("❌ Erro inesperado no webhook:")
+        print("❌ Erro ao processar webhook:", str(e))
         return jsonify({"status": "error", "detail": str(e)}), 500
 
 if __name__ == "__main__":
