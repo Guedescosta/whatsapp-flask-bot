@@ -19,16 +19,22 @@ def webhook():
         data = request.get_json()
         print("📦 Dados brutos recebidos:", data)
 
-        if not data or "message" not in data:
+        message = None
+        if "messages" in data and isinstance(data["messages"], list):
+            message = data["messages"][0]
+        elif "message" in data:
+            message = data["message"]
+
+        if not message:
             print("⚠️ Payload inválido (sem 'message')")
             return jsonify({"status": "ignored"}), 200
 
-        message = data["message"]
         phone = message.get("from")
         text = None
 
+        # Trata texto como string ou dicionário
         if isinstance(message.get("text"), dict):
-            text = message["text"].get("body")
+            text = message["text"].get("message") or message["text"].get("body")
         elif isinstance(message.get("text"), str):
             text = message["text"]
 
