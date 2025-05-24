@@ -1,90 +1,93 @@
 from flask import Flask, request, jsonify
 import os
-import logging
 import requests
+import logging
 
-# ——— Configuração de logging ———
+# 1) Configuração de logs
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s %(levelname)s %(message)s"
 )
 
-# ——— App e variáveis de ambiente ———
 app = Flask(__name__)
+
+# 2) Apenas duas env vars
 ZAPI_INSTANCE_ID = os.getenv("ZAPI_INSTANCE_ID")
 ZAPI_TOKEN       = os.getenv("ZAPI_TOKEN")
-SEND_TEXT_URL    = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_TOKEN}/send-text"
+if not ZAPI_INSTANCE_ID or not ZAPI_TOKEN:
+    logging.critical("⚠️ As env vars ZAPI_INSTANCE_ID e ZAPI_TOKEN devem estar definidas!")
+    # Em produção você pode querer abortar aqui.
 
-# ——— Health‐check ———
+# Aux — endpoint da Z-API
+ZAPI_URL = (
+    "https://api.z-api.io"
+    f"/instances/{ZAPI_INSTANCE_ID}"
+    f"/token/{ZAPI_TOKEN}"
+    "/send-text"
+)
+
+def send_text(phone: str, message: str):
+    """Envia a mensagem via Z-API e retorna (sucesso, detalhe)."""
+    payload = {"phone": phone, "message": message}
+    headers = {"Content-Type": "application/json"}
+    logging.info(f"📤 POST→Z-API {ZAPI_URL}  payload={payload}")
+    try:
+        resp = requests.post(ZAPI_URL, json=payload, headers=headers, timeout=10)
+        resp.raise_for_status()
+        logging.info(f"✅ Z-API respondeu: {resp.text}")
+        return True, resp.json()
+    except requests.exceptions.HTTPError as http_err:
+        logging.error(f"❌ Z-API HTTPError: {http_err} — {resp.text}")
+        return False, resp.text
+    except Exception as e:
+        logging.error(f"❌ Erro ao chamar Z-API: {e}")
+        return False, str(e)
+
 @app.route("/", methods=["GET"])
 def home():
-    return "✅ Bot do WhatsApp está rodando com sucesso!", 200
+    return "✅ Bot do WhatsApp está rodando!"
 
-# ——— Webhook endpoint ———
 @app.route("/webhook", methods=["POST"])
 def webhook():
     logging.info("✉️ Webhook recebido")
     data = request.get_json(silent=True)
-    if data is None:
-        logging.warning("⚠️ JSON inválido ou vazio")
-        return jsonify({"status": "invalid_json"}), 400
-
-    logging.debug("📦 Payload bruto: %s", data)
+    logging.info(f"📦 Payload bruto: {data}")
 
     phone = None
     text  = None
 
-    # 1) Caso “ReceivedCallback” da Z-API (payload “flat”)
-    if isinstance(data.get("text"), dict) and data.get("phone"):
-        phone = data["phone"]
+    # 1) Caso “novo”: tudo no root, .get("text",{})["message"]
+    if data and "phone" in data and isinstance(data.get("text"), dict):
+        phone = data.get("phone")
         text  = data["text"].get("message")
 
-    # 2) Caso wrapper em data["message"]
-    elif isinstance(data.get("message"), dict):
+    # 2) Caso “antigo”: mensagem aninhada
+    elif data and isinstance(data.get("message"), dict):
         msg = data["message"]
-        phone = msg.get("from")
-        t = msg.get("text")
-        if isinstance(t, dict):
-            # varia entre 'body' ou 'message' dependendo da versão
-            text = t.get("body") or t.get("message")
-        else:
-            text = t
+        phone = msg.get("from") or msg.get("phone")
+        # nLU: pode vir como body ou como message
+        txt = msg.get("text")
+        if isinstance(txt, dict):
+            text = txt.get("body") or txt.get("message")
+        elif isinstance(txt, str):
+            text = txt
 
-    else:
-        logging.warning("⚠️ Estrutura de payload não reconhecida — ignorando")
-        return jsonify({"status": "ignored"}), 200
-
-    # validação final
     if not phone or not text:
-        logging.warning("⚠️ Falta telefone ou texto na mensagem — ignorando")
+        logging.warning("⚠️ Payload sem telefone/texto — ignorando")
         return jsonify({"status": "ignored"}), 200
 
-    logging.info("📲 Mensagem de %s: %r", phone, text)
+    logging.info(f"📞 De: {phone}  |  📝 Msg: “{text}”")
 
-    # resposta fixa (pode inserir NLP/intenções aqui)
-    resposta = "Olá! 👋 Recebemos sua mensagem e em breve retornaremos."
+    # Resposta simples
+    resposta = "Olá! Recebemos sua mensagem e logo retornaremos. 😊"
 
-    # envia a mensagem de volta
-    try:
-        resp = requests.post(
-            SEND_TEXT_URL,
-            json={"phone": phone, "message": resposta},
-            headers={"Content-Type": "application/json"},
-            timeout=10
-        )
-        resp.raise_for_status()
-        logging.info("✅ Z-API respondeu: %s", resp.text)
-        return jsonify({"status": "sent"}), 200
+    success, detail = send_text(phone, resposta)
+    if success:
+        return jsonify({"status": "message sent"}), 200
+    else:
+        return jsonify({"status": "error", "detail": detail}), 500
 
-    except requests.exceptions.HTTPError as e:
-        logging.error("❌ Z-API HTTPError: %s — %s", e, resp.text)
-        return jsonify({"status": "error", "detail": resp.text}), 500
-    except requests.exceptions.RequestException as e:
-        logging.error("❌ Erro de requisição à Z-API: %s", e)
-        return jsonify({"status": "error", "detail": str(e)}), 500
-
-# ——— Inicialização ———
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
-    logging.info("🚀 Iniciando na porta %d", port)
+    logging.info(f"🚀 Iniciando Flask na porta {port}")
     app.run(host="0.0.0.0", port=port)
