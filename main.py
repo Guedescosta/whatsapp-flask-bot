@@ -1,4 +1,7 @@
-from flask import Flask, request, jsonify import os import logging import requests
+from flask import Flask, request, jsonify 
+import os 
+import logging 
+import requests
 
 --- Configurações iniciais ---
 
