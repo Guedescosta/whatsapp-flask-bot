@@ -1,102 +1,87 @@
-from flask import Flask, request, jsonify 
-import os 
-import logging 
+from flask import Flask, request, jsonify
+import os
+import logging
 import requests
 
---- Configurações iniciais ---
-
-logging.basicConfig( level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s' ) app = Flask(name)
-
-Variáveis de ambiente (definidas no Render)
-
-ZAPI_INSTANCE_ID = os.getenv('ZAPI_INSTANCE_ID') ZAPI_TOKEN = os.getenv('ZAPI_TOKEN')
-
---- Funções auxiliares ---
-
-def clean_phone(raw_phone: str) -> str | None: """ Remove caracteres não numéricos e retorna None se inválido. """ if not raw_phone: return None digits = ''.join(filter(str.isdigit, raw_phone)) return digits if digits else None
-
-def send_whatsapp_message(phone: str, message: str) -> tuple[bool, str]: """ Envia mensagem de texto via Z-API. Retorna (True, resposta_json) ou (False, detalhe_erro). """ if not ZAPI_INSTANCE_ID or not ZAPI_TOKEN: logging.error("Z-API config missing: INSTANCE_ID or TOKEN") return False, "Configuration error"
-
-url = (
-    f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}"
-    f"/token/{ZAPI_TOKEN}/send-text"
+# ── Logging ───────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
-payload = {
-    "phone": phone,
-    "message": message
-    # Se a API exigir, descomente: "type": "text"
-}
-headers = {"Content-Type": "application/json"}
 
-try:
-    logging.info(f"📤 Sending → {url} payload={payload}")
-    response = requests.post(url, json=payload, headers=headers, timeout=10)
-    response.raise_for_status()
-    logging.info(f"✅ Z-API response: {response.text}")
-    return True, response.text
+app = Flask(__name__)
 
-except requests.exceptions.HTTPError as http_err:
-    logging.error(f"❌ Z-API HTTPError: {http_err} - {response.text}")
-    return False, f"HTTPError: {response.text}"
-except requests.exceptions.RequestException as req_err:
-    logging.error(f"❌ Z-API RequestException: {req_err}")
-    return False, str(req_err)
+# ── Variáveis de ambiente ──────────────────────────────────────────────────
+ZAPI_INSTANCE_ID = os.getenv("ZAPI_INSTANCE_ID")
+ZAPI_TOKEN       = os.getenv("ZAPI_TOKEN")
+ZAPI_BASE_URL    = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_TOKEN}"
 
---- Rotas Flask ---
+if not ZAPI_INSTANCE_ID or not ZAPI_TOKEN:
+    logging.critical("🚨 ZAPI_INSTANCE_ID ou ZAPI_TOKEN não definidos!")
+    raise RuntimeError("Verifique as env vars ZAPI_INSTANCE_ID e ZAPI_TOKEN")
 
-@app.route('/', methods=['GET']) def home(): """Saúde: confirma que o bot está rodando.""" return "✅ Bot do WhatsApp rodando!"
+# ── Helper de envio ────────────────────────────────────────────────────────
+def send_whatsapp(phone: str, message: str):
+    payload = {"phone": phone, "message": message}
+    headers = {"Content-Type": "application/json"}
+    url = f"{ZAPI_BASE_URL}/send-text"
+    try:
+        logging.info(f"📤 POST {url} → payload={payload}")
+        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        resp.raise_for_status()
+        logging.info(f"✅ Z-API respondeu: {resp.text}")
+        return True, resp.json()
+    except requests.HTTPError as e:
+        logging.error(f"❌ HTTPError: {e} — {resp.text}")
+        return False, resp.text
+    except Exception as e:
+        logging.error(f"❌ Erro no send_whatsapp: {e}")
+        return False, str(e)
 
-@app.route('/webhook', methods=['POST']) def webhook(): """Recebe webhooks da Z-API e responde automaticamente.""" data = request.get_json(silent=True) logging.info(f"📩 Webhook received: {data}")
+# ── Health-check ──────────────────────────────────────────────────────────
+@app.route("/", methods=["GET"])
+def home():
+    return "✅ Bot do WhatsApp está rodando!", 200
 
-if not data:
-    logging.warning("⚠️ Empty or invalid JSON payload")
-    return jsonify(status="ignored", reason="invalid_json"), 200
+# ── Webhook ────────────────────────────────────────────────────────────────
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    logging.info("✉️ Webhook recebido")
+    data = request.get_json(silent=True)
+    logging.info(f"📦 Payload bruto: {data}")
 
-# Extrai telefone e texto, suportando diferentes formatos de payload
-phone = None
-text = None
+    phone = None
+    text  = None
 
-# Caso da Z-API: payload tipo ReceivedCallback ou RECEIVED
-if data.get('phone') and isinstance(data.get('text'), dict):
-    phone = clean_phone(data.get('phone'))
-    text = data['text'].get('message')
+    # v2: ReceivedCallback / RECEIVED
+    if data.get("phone") and isinstance(data.get("text"), dict):
+        phone = data["phone"]
+        text  = data["text"].get("message")
 
-# Fallback: payload aninhado em data['message']
-elif 'message' in data:
-    msg = data['message']
-    phone = clean_phone(msg.get('from') or msg.get('phone'))
-    txt = msg.get('text')
-    if isinstance(txt, dict):
-        text = txt.get('body') or txt.get('message')
-    elif isinstance(txt, str):
-        text = txt
+    # v1: message aninhada
+    elif isinstance(data.get("message"), dict):
+        m = data["message"]
+        phone = m.get("from") or m.get("phone")
+        t = m.get("text")
+        if isinstance(t, dict):
+            text = t.get("body") or t.get("message")
+        elif isinstance(t, str):
+            text = t
 
-if not phone or not text:
-    logging.warning("⚠️ Missing phone or text, ignoring")
-    return jsonify(status="ignored", reason="missing_phone_or_text"), 200
+    if not phone or not text:
+        logging.warning("⚠️ Sem phone/text — ignorando")
+        return jsonify(status="ignored"), 200
 
-logging.info(f"📞 From: {phone} | 📝 Msg: {text}")
+    logging.info(f"📞 De: {phone} | Msg: “{text}”")
+    resposta = "Olá! Recebemos sua mensagem e logo retornaremos. 😊"
 
-# Lógica de auto-resposta (simples)
-txt_lower = text.lower()
-if 'horário' in txt_lower or 'funcionamento' in txt_lower:
-    reply = 'Nosso horário: seg-sex, 9h-18h.'
-elif 'endereço' in txt_lower or 'localiza' in txt_lower:
-    reply = 'Estamos na Rua Exemplo, 123, Centro.'
-elif 'contato' in txt_lower or 'telefone' in txt_lower or 'email' in txt_lower:
-    reply = 'Ligue (XX) XXXX-XXXX ou envie email para contato@exemplo.com.'
-elif any(g in txt_lower for g in ['oi', 'olá', 'bom dia', 'boa tarde']):
-    reply = 'Olá! Como posso ajudar hoje?'
-else:
-    reply = 'Olá! 👋 Recebemos sua mensagem e em breve retornaremos.'
+    ok, detail = send_whatsapp(phone, resposta)
+    if ok:
+        return jsonify(status="sent"), 200
+    else:
+        return jsonify(status="error", detail=detail), 500
 
-# Envia resposta
-success, detail = send_whatsapp_message(phone, reply)
-if success:
-    return jsonify(status="sent"), 200
-else:
-    logging.error(f"❌ Failed to send to {phone}: {detail}")
-    return jsonify(status="error", detail=detail), 500
-
-if name == 'main': port = int(os.getenv('PORT', 10000)) logging.info(f"🚀 Starting app on port {port}") app.run(host='0.0.0.0', port=port)
-
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 10000))
+    logging.info(f"🚀 Iniciando na porta {port}")
+    app.run(host="0.0.0.0", port=port)
