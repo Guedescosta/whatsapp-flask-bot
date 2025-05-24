@@ -92,5 +92,8 @@ success, detail = send_whatsapp_message(phone, reply)
 if success:
     return jsonify(status="sent"), 200
 else:
-    logging.error(f"❌
+    logging.error(f"❌ Failed to send to {phone}: {detail}")
+    return jsonify(status="error", detail=detail), 500
+
+if name == 'main': port = int(os.getenv('PORT', 10000)) logging.info(f"🚀 Starting app on port {port}") app.run(host='0.0.0.0', port=port)
 
