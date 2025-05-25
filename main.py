@@ -1,67 +1,93 @@
 import os
+import logging
 import requests
 from flask import Flask, request, jsonify
-from openai import OpenAI
-import logging
+import openai
 
-# Inicializa Flask e log
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-
-# Variáveis de ambiente (configure no Render)
+# Configurações
 ZAPI_INSTANCE_ID = os.getenv("ZAPI_INSTANCE_ID")
 ZAPI_TOKEN = os.getenv("ZAPI_TOKEN")
+ZAPI_CLIENT_TOKEN = os.getenv("ZAPI_CLIENT_TOKEN")  # Se sua instância exige
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GRUPO_AVISOS = "5541997083679"  # grupo "Vendas - IA"
 
-# Inicializa o cliente OpenAI novo
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Inicialização
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+openai.api_key = OPENAI_API_KEY
 
-# Memória simples para evitar loop
-ULTIMAS_MENSAGENS = {}
+# Lista para controle de loop (último número que recebeu msg)
+ultimos_contatos = {}
+
+def send_whatsapp_message(phone: str, message: str):
+    url = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_TOKEN}/send-text"
+    payload = {
+        "phone": phone,
+        "message": message,
+        "type": "text"
+    }
+    headers = {
+        "Content-Type": "application/json"
+    }
+    if ZAPI_CLIENT_TOKEN:
+        headers["Client-Token"] = ZAPI_CLIENT_TOKEN
+
+    try:
+        logging.info(f"📤 Enviando para {phone} → {message}")
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        logging.info(f"✅ Enviado: {response.text}")
+    except requests.exceptions.RequestException as err:
+        logging.error(f"❌ Erro ao enviar mensagem: {err} - {getattr(err.response, 'text', '')}")
 
 @app.route("/", methods=["GET"])
 def home():
-    return "🤖 Bot do WhatsApp está rodando!"
+    return "Bot do WhatsApp com GPT está rodando!"
 
-@app.route("/", methods=["POST"])
-def receber_mensagem():
-    data = request.json
-    logging.info("✉️ Webhook recebido")
-    logging.info(f"📦 Payload bruto: {data}")
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json()
+    logging.info(f"✉️ Webhook recebido")
+    logging.info(f"📦 Payload: {data}")
 
-    # Ignora mensagens enviadas por você mesmo
-    if data.get("fromMe"):
-        return jsonify({"status": "ignorado"}), 200
+    phone = data.get("phone")
+    message_data = data.get("text")
+    text = message_data.get("message") if isinstance(message_data, dict) else None
 
-    telefone = data.get("phone")
-    mensagem = data.get("text", {}).get("message", "")
+    if not phone or not text:
+        logging.warning("⚠️ Ignorado - sem telefone ou texto")
+        return jsonify({"status": "ignored"})
 
-    # Verifica se já respondeu a essa mensagem
-    if ULTIMAS_MENSAGENS.get(telefone) == mensagem:
-        return jsonify({"status": "loop evitado"}), 200
+    # Evitar loop: só responde se o número for novo ou texto diferente
+    if ultimos_contatos.get(phone) == text:
+        logging.info("♻️ Mensagem repetida ignorada para evitar loop")
+        return jsonify({"status": "ignored", "reason": "loop_prevention"})
 
-    ULTIMAS_MENSAGENS[telefone] = mensagem
+    ultimos_contatos[phone] = text
+
+    logging.info(f"📞 De: {phone} | 📝 Msg: '{text}'")
 
     try:
-        # Envia para o ChatGPT
-        resposta = client.chat.completions.create(
+        resposta = openai.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": mensagem}]
+            messages=[
+                {"role": "system", "content": "Você é um atendente educado, natural e prestativo. Responda como se fosse uma conversa humana e não um robô."},
+                {"role": "user", "content": text}
+            ]
         )
-        texto_resposta = resposta.choices[0].message.content.strip()
+        reply = resposta.choices[0].message.content.strip()
     except Exception as e:
-        logging.error(f"❌ Erro no ChatGPT: {e}")
-        texto_resposta = "Desculpe, estamos com instabilidade no atendimento. Tente novamente mais tarde."
+        logging.error(f"❌ Erro no GPT: {e}")
+        reply = "Desculpe, estamos com instabilidade no atendimento. Tente novamente mais tarde."
 
-    # Envia a resposta via Z-API
-    url = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_TOKEN}/send-text"
-    payload = {"phone": telefone, "message": texto_resposta}
-    response = requests.post(url, json=payload)
+    # Envia resposta para o cliente
+    send_whatsapp_message(phone, reply)
 
-    logging.info(f"📤 Enviado para {telefone} → {texto_resposta}")
-    logging.info(f"🧾 Resposta da Z-API: {response.text}")
+    # Envia notificação para o grupo
+    grupo_msg = f"📬 Nova mensagem de {phone}\n📝: {text}\n🤖: {reply}"
+    send_whatsapp_message(GRUPO_AVISOS, grupo_msg)
 
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "success"})
 
 if __name__ == "__main__":
     app.run(debug=True)
