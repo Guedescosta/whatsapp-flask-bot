@@ -1,120 +1,88 @@
 from flask import Flask, request, jsonify
 import os
-import logging
 import requests
+import logging
+import openai
 
-# ─── Configuração de logging ───────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+# === CONFIGURACOES ===
+ZAPI_INSTANCE_ID = os.environ.get("ZAPI_INSTANCE_ID")
+ZAPI_TOKEN = os.environ.get("ZAPI_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+ADMIN_GROUP = "41997083679"  # grupo ou numero para notificacoes (remetente eh 5541...)
 
-# ─── Instância Flask ───────────────────────────────────────────────────────
+openai.api_key = OPENAI_API_KEY
+
+# === LOGS ===
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# === FLASK ===
 app = Flask(__name__)
 
-# ─── Variáveis de ambiente ─────────────────────────────────────────────────
-ZAPI_INSTANCE_ID   = os.environ.get("ZAPI_INSTANCE_ID")
-ZAPI_TOKEN         = os.environ.get("ZAPI_TOKEN")
-ZAPI_CLIENT_TOKEN  = os.environ.get("ZAPI_CLIENT_TOKEN")
-
-if not all([ZAPI_INSTANCE_ID, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN]):
-    logging.error("❌ Faltam variáveis de ambiente Z-API (INSTANCE_ID, TOKEN ou CLIENT_TOKEN).")
-
-# ─── Funções auxiliares ────────────────────────────────────────────────────
-def clean_phone(raw: str) -> str | None:
-    """Remove tudo que não for dígito e garante código de país Brasil (55)."""
-    if not raw:
-        return None
-    digits = "".join(filter(str.isdigit, raw))
-    # força prefixo brasileiro se faltar
-    if len(digits) in (10, 11) and not digits.startswith("55"):
-        digits = "55" + digits
-    return digits if digits else None
-
-def send_whatsapp_message(phone: str, message: str) -> tuple[bool, dict | str]:
-    """Envia mensagem via Z-API, incluindo Client-Token no header."""
-    url = (
-        f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}"
-        f"/token/{ZAPI_TOKEN}/send-text"
-    )
-    payload = {
-        "phone": phone,
-        "message": message
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Client-Token": ZAPI_CLIENT_TOKEN
-    }
-
-    logging.info(f"📤 POST→{url} payload={payload}")
+# === UTILIDADES ===
+def send_whatsapp_message(phone: str, message: str):
+    url = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_TOKEN}/send-text"
+    payload = {"phone": phone, "message": message}
+    headers = {"Content-Type": "application/json"}
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=10)
-        resp.raise_for_status()
-        logging.info(f"✅ Z-API respondeu: {resp.text}")
-        return True, resp.json()
-    except requests.exceptions.HTTPError as e:
-        logging.error(f"❌ Z-API HTTPError: {e} — {resp.text}")
-        return False, resp.text
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        r.raise_for_status()
+        logging.info(f"✅ Mensagem enviada para {phone}: {message}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"❌ Erro ao enviar para {phone}: {e}")
+
+def gerar_resposta_chatgpt(mensagem_usuario):
+    try:
+        resposta = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Você é um atendente simpático e natural, focado em ajudar o cliente e fechar vendas."},
+                {"role": "user", "content": mensagem_usuario}
+            ]
+        )
+        return resposta.choices[0].message.content.strip()
     except Exception as e:
-        logging.error(f"❌ Erro na requisição Z-API: {e}")
-        return False, str(e)
+        logging.error(f"Erro no ChatGPT: {e}")
+        return "Desculpe, estou com dificuldades técnicas no momento. Pode repetir mais tarde?"
 
-def get_resposta_bot(text: str) -> str:
-    """Gera resposta simples baseada em palavras-chave."""
-    t = text.lower()
-    if any(k in t for k in ("horário", "funcionamento")):
-        return "Nosso horário de funcionamento é de seg-sex das 9h às 18h."
-    if any(k in t for k in ("endereço", "localização")):
-        return "Nosso endereço: Rua Exemplo, 123, Centro."
-    if any(k in t for k in ("contato", "telefone", "email")):
-        return "📞 (XX) XXXX-XXXX  ✉️ contato@exemplo.com"
-    if any(k in t for k in ("oi", "olá", "bom dia", "boa tarde")):
-        return "Olá! 👋 Como posso ajudar?"
-    return "Olá! Recebemos sua mensagem e logo retornaremos. 😊"
-
-# ─── Rotas ─────────────────────────────────────────────────────────────────
+# === ROTA PRINCIPAL ===
 @app.route("/", methods=["GET"])
 def home():
-    return "✅ Bot do WhatsApp rodando!"
+    return "✅ Bot online"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    logging.info("✉️ Webhook recebido")
     data = request.get_json(silent=True)
-    if not data:
-        logging.warning("⚠️ Payload JSON inválido ou vazio")
-        return jsonify({"status": "ignored", "detail": "invalid JSON"}), 400
-
+    logging.info("\n📩 Webhook recebido")
     logging.info(f"📦 Payload bruto: {data}")
 
-    # Extrai texto e número
-    phone_raw = data.get("phone") or data.get("message", {}).get("from")
-    text_field = data.get("text") or data.get("message", {}).get("text")
+    try:
+        phone = data.get("phone")
+        text_dict = data.get("text")
+        text = text_dict.get("message") if isinstance(text_dict, dict) else None
 
-    phone = clean_phone(phone_raw)
-    text = None
-    if isinstance(text_field, dict):
-        # Z-API usa chave "message" para texto
-        text = text_field.get("message") or text_field.get("body")
-    elif isinstance(text_field, str):
-        text = text_field
+        if not phone or not text:
+            logging.warning("⚠️ Mensagem sem número ou texto válido.")
+            return jsonify({"status": "ignored"}), 200
 
-    if not phone or not text:
-        logging.warning(f"⚠️ Ignorando: phone={phone!r}, text={text!r}")
-        return jsonify({"status": "ignored", "reason": "missing phone or text"}), 200
+        if phone == ADMIN_GROUP:
+            logging.info("🔁 Ignorando resposta ao grupo de notificações para evitar loop.")
+            return jsonify({"status": "skipped"}), 200
 
-    logging.info(f"📞 From: {phone} | 📝 Msg: “{text}”")
+        logging.info(f"📞 De: {phone} | 📝 Msg: '{text}'")
 
-    # Gera e envia resposta
-    resposta = get_resposta_bot(text)
-    ok, detail = send_whatsapp_message(phone, resposta)
-    if ok:
-        return jsonify({"status": "sent", "detail": detail}), 200
-    else:
-        return jsonify({"status": "error", "detail": detail}), 500
+        resposta = gerar_resposta_chatgpt(text)
+        send_whatsapp_message(phone, resposta)
 
-# ─── Execução ───────────────────────────────────────────────────────────────
+        # Enviar notificação ao grupo com resumo
+        aviso = f"📥 Nova mensagem de {phone}\nTexto: {text}\nResposta: {resposta}"
+        send_whatsapp_message(ADMIN_GROUP, aviso)
+
+        return jsonify({"status": "ok"}), 200
+
+    except Exception as e:
+        logging.exception("Erro no webhook")
+        return jsonify({"status": "error", "detail": str(e)}), 500
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    logging.info(f"🚀 Iniciando app na porta {port}")
     app.run(host="0.0.0.0", port=port)
