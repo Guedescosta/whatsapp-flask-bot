@@ -9,13 +9,17 @@ for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     os.environ.pop(var, None)
 
 # ─── Configurações de ambiente ────────────────────────────────────────────
-ZAPI_INSTANCE_ID   = os.getenv("ZAPI_INSTANCE_ID", "")
-ZAPI_TOKEN         = os.getenv("ZAPI_TOKEN", "")
-ZAPI_CLIENT_TOKEN  = os.getenv("ZAPI_CLIENT_TOKEN", "")
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
+ZAPI_INSTANCE_ID  = os.getenv("ZAPI_INSTANCE_ID", "")
+ZAPI_TOKEN        = os.getenv("ZAPI_TOKEN", "")
+ZAPI_CLIENT_TOKEN = os.getenv("ZAPI_CLIENT_TOKEN", "")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 
-if not all([ZAPI_INSTANCE_ID, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN, OPENAI_API_KEY, GRUPO_AVISOS]):
-    raise RuntimeError("Faltam variáveis de ambiente: verifique ZAPI_INSTANCE_ID, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN, OPENAI_API_KEY")
+# verifica variáveis obrigatórias
+if not all([ZAPI_INSTANCE_ID, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN, OPENAI_API_KEY]):
+    raise RuntimeError(
+        "Faltam variáveis de ambiente: verifique ZAPI_INSTANCE_ID, ZAPI_TOKEN, "
+        "ZAPI_CLIENT_TOKEN e OPENAI_API_KEY"
+    )
 
 # ─── Inicializa Flask e Logger ───────────────────────────────────────────
 app = Flask(__name__)
@@ -35,7 +39,7 @@ def clean_phone(raw: str) -> str | None:
     digits = "".join(filter(str.isdigit, raw or ""))
     if not digits:
         return None
-    # garante código do Brasil se faltar (opcional)
+    # garante código do Brasil se faltar
     if len(digits) in (10, 11) and not digits.startswith("55"):
         digits = "55" + digits
     return digits
@@ -121,15 +125,11 @@ def webhook():
         logging.error(f"❌ Erro no GPT: {e}")
         resposta = "Desculpe, estamos com instabilidade no atendimento. Tente novamente mais tarde."
 
-    # ─── Envia ao cliente e ao grupo de avisos ───────────────────────────
+    # ─── Envia ao cliente ────────────────────────────────────────────────
     send_whatsapp_message(phone, resposta)
-    send_whatsapp_message(
-        GRUPO_AVISOS,
-        f"📬 Nova mensagem de {phone}\n📝: {msg}\n🤖: {resposta}"
-    )
 
     return jsonify({"status": "ok"})
 
 if __name__ == "__main__":
-    # escuta na porta padrão 5000 com debug desativado em produção
+    # executa na porta definida por PORT (ou 5000)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
