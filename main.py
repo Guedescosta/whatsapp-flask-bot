@@ -13,10 +13,9 @@ ZAPI_INSTANCE_ID   = os.getenv("ZAPI_INSTANCE_ID", "")
 ZAPI_TOKEN         = os.getenv("ZAPI_TOKEN", "")
 ZAPI_CLIENT_TOKEN  = os.getenv("ZAPI_CLIENT_TOKEN", "")
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
-GRUPO_AVISOS       = os.getenv("GRUPO_AVISOS", "")  # ex: "5541997083679"
 
 if not all([ZAPI_INSTANCE_ID, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN, OPENAI_API_KEY, GRUPO_AVISOS]):
-    raise RuntimeError("Faltam variáveis de ambiente: verifique ZAPI_INSTANCE_ID, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN, OPENAI_API_KEY e GRUPO_AVISOS")
+    raise RuntimeError("Faltam variáveis de ambiente: verifique ZAPI_INSTANCE_ID, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN, OPENAI_API_KEY")
 
 # ─── Inicializa Flask e Logger ───────────────────────────────────────────
 app = Flask(__name__)
