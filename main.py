@@ -9,12 +9,12 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # ─── CONFIGURAÇÃO ─────────────────────────────────────────────────────────────
-ZAPI_INSTANCE_ID  = os.getenv("ZAPI_INSTANCE_ID")      # sua instance_id da Z-API
-ZAPI_TOKEN        = os.getenv("ZAPI_TOKEN")            # seu token da Z-API
-ZAPI_CLIENT_TOKEN = os.getenv("ZAPI_CLIENT_TOKEN")     # Client-Token da Z-API
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")        # sua chave da OpenAI
+ZAPI_INSTANCE_ID  = os.getenv("ZAPI_INSTANCE_ID")
+ZAPI_TOKEN        = os.getenv("ZAPI_TOKEN")
+ZAPI_CLIENT_TOKEN = os.getenv("ZAPI_CLIENT_TOKEN")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 
-# cliente OpenAI sem proxies para evitar erro 'unexpected argument proxies'
+# cliente OpenAI sem proxies
 openai_client = OpenAI(
     api_key=OPENAI_API_KEY,
     http_client=httpx.Client()
@@ -40,7 +40,7 @@ def send_whatsapp_message(phone: str, text: str):
         resp.raise_for_status()
         logging.info(f"✅ Mensagem enviada para {phone}: {resp.text}")
     except Exception as e:
-        logging.error(f"❌ Falha ao enviar para {phone}: {e} — {getattr(resp, 'text', '')}")
+        logging.error(f"❌ Falha ao enviar para {phone}: {e}")
 
 # ─── ROTAS ─────────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
@@ -54,6 +54,8 @@ def webhook():
     logging.info(f"📦 Payload: {data}")
 
     phone = data.get("phone")
+    # agora tentamos extrair nome, se enviado no payload
+    cliente = data.get("name", "").strip()
     msg   = data.get("text", {}).get("message")
     if not phone or not msg:
         return jsonify({"status": "ignored"})
@@ -63,20 +65,27 @@ def webhook():
         logging.info("👤 Mensagem própria—ignorada")
         return jsonify({"status": "ignored_self"})
 
-    # filtra texto puro e previne loop de eco
+    # prevenção de loop
     msg_pura = msg.strip().lower().split("\n")[0]
     if ultimos_contatos.get(phone) == msg_pura:
         logging.info("♻️ Mensagem repetida—loop evitado")
         return jsonify({"status": "loop_prevented"})
     ultimos_contatos[phone] = msg_pura
 
-    # catálogo para prompt
+    # catálogo como contexto
     catalogo = (
         "Catálogo de produtos (5L): "
         "Lava roupas R$35, Amaciante R$35, Desinfetante R$30, Água sanitária R$25, "
-        "Alvejante sem cloro R$30, Detergente R$30, Álcool perfumado R$40, Passa-fácil/Branquinho R$40; "
-        "Kit 5 produtos R$145; "
-        "Embalagens 1L: Álcool e Branquinho conforme preço de 5L proporcional."
+        "Alvejante sem cloro R$30, Detergente R$30, Álcool perfumado R$40, Branquinho R$40; "
+        "Kit 5 produtos R$145."
+    )
+
+    # construindo prompt do sistema
+    saudacao = f"Olá, {cliente}! " if cliente else ""
+    system_content = (
+        f"{saudacao}Você é um atendente humano da BG Produtos de Limpeza. "
+        "Fale como o Thiago, seja direto e simpático. "
+        f"{catalogo}"
     )
 
     # chamada ao GPT
@@ -84,15 +93,8 @@ def webhook():
         completion = openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Você é um atendente humano da BG Produtos de Limpeza. "
-                        "Fale como o Thiago, seja direto e simpático. "
-                        f"{catalogo}"
-                    )
-                },
-                {"role": "user", "content": msg}
+                {"role": "system", "content": system_content},
+                {"role": "user",   "content": msg}
             ]
         )
         resposta = completion.choices[0].message.content.strip()
@@ -100,7 +102,7 @@ def webhook():
         logging.error(f"❌ Erro no GPT: {e}")
         resposta = "Desculpe, estamos com instabilidade no atendimento. Tente novamente mais tarde."
 
-    # envia resposta ao cliente
+    # envia resposta
     send_whatsapp_message(phone, resposta)
     return jsonify({"status": "ok"})
 
