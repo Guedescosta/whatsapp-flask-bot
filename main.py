@@ -4,7 +4,6 @@ import logging
 import requests
 import httpx
 import json
-import re
 from datetime import datetime, timedelta
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -19,21 +18,26 @@ ZAPI_CLIENT_TOKEN = os.getenv("ZAPI_CLIENT_TOKEN")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 ZAPI_GROUP_ID     = os.getenv("ZAPI_GROUP_ID")  # ID do grupo “Vendas - IA”
 
-# cliente OpenAI sem proxies
-openai_client = OpenAI(
-    api_key=OPENAI_API_KEY,
-    http_client=httpx.Client()
-)
+openai_client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client())
 
-# APScheduler para jobs em background
+# APScheduler
 scheduler = BackgroundScheduler()
 logging.info("🔄 Iniciando APScheduler...")
 scheduler.start()
 
-# ─── ARMAZENAMENTO EM JSON ─────────────────────────────────────────────────────
-CLIENTES_FILE = "clientes.json"
-ESTADOS_FILE  = "estados.json"
-PEDIDOS_FILE  = "pedidos.json"
+def enviar_motivacao():
+    frase = "“Cada desafio superado no código é um passo a mais rumo ao seu objetivo: continue codando com confiança!”"
+    if ZAPI_GROUP_ID:
+        send_whatsapp_message(ZAPI_GROUP_ID, frase)
+
+scheduler.add_job(enviar_motivacao, trigger="cron",
+                  hour=8, minute=0, timezone="America/Sao_Paulo")
+scheduler.add_job(enviar_motivacao, trigger="date",
+                  run_date=datetime.now() + timedelta(minutes=1))
+
+# ─── ARMAZENAMENTO ─────────────────────────────────────────────────────────────
+STATE_FILE   = "estados.json"   # guarda slots e estados de usuário
+CUSTOMER_FILE= "clientes.json"
 
 def load_json(path):
     try:
@@ -46,220 +50,136 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-clientes = load_json(CLIENTES_FILE)
-estados  = load_json(ESTADOS_FILE)
-pedidos  = load_json(PEDIDOS_FILE)
+estados   = load_json(STATE_FILE)    # { phone: {slots..., "esperando": key} }
+clientes  = load_json(CUSTOMER_FILE) # { phone: "Nome" }
 
-# ─── UTILITÁRIAS ────────────────────────────────────────────────────────────────
-def sanitize_name(raw: str) -> str:
-    name = re.split(r"[\d–\-]", raw)[0].strip()
-    return name if re.fullmatch(r"[A-Za-zÀ-ÿ ]+", name) else ""
-
-# ─── ENVIO PELO Z-API ───────────────────────────────────────────────────────────
+# ─── UTILITÁRIAS ───────────────────────────────────────────────────────────────
 def send_whatsapp_message(phone: str, text: str):
     url = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_TOKEN}/send-text"
-    payload = {"phone": phone, "message": text, "type": "text"}
     headers = {"Content-Type": "application/json", "Client-Token": ZAPI_CLIENT_TOKEN}
     try:
-        resp = requests.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        logging.info(f"✅ Mensagem enviada para {phone}: {resp.text}")
+        r = requests.post(url, json={"phone":phone,"message":text,"type":"text"}, headers=headers)
+        r.raise_for_status()
+        logging.info(f"✅ Mensagem enviada para {phone}: {r.text}")
     except Exception as e:
         logging.error(f"❌ Falha ao enviar para {phone}: {e}")
 
 def send_group_message(text: str):
     if ZAPI_GROUP_ID:
         send_whatsapp_message(ZAPI_GROUP_ID, text)
-    else:
-        logging.warning("⚠️ ZAPI_GROUP_ID não configurado; não foi possível enviar ao grupo.")
 
-# ─── JOBS DE AGENDAMENTO ────────────────────────────────────────────────────────
-def enviar_motivacao():
-    frase = "“Cada desafio superado no código é um passo a mais rumo ao seu objetivo: continue codando com confiança!”"
-    send_group_message(frase)
+def extrair_slots(msg: str) -> dict:
+    """
+    Usa GPT para extrair item, qt, data, bairro, urgente e lista de faltando.
+    """
+    prompt = f"""
+Você é um parser de pedidos. Retorne apenas JSON com:
+- item (string)
+- qt (inteiro)
+- data (string)
+- bairro (string)
+- urgente (true/false)
+- faltando: lista de chaves não detectadas
+Exemplo de saída:
+{{"item":"Lava roupas","qt":1,"data":"amanhã","bairro":"Centro","urgente":false,"faltando":[]}}
+Frase do cliente: "{msg}"
+"""
+    res = openai_client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role":"system","content":prompt}]
+    )
+    return json.loads(res.choices[0].message.content)
 
-# Cron diário às 08:00 (Brasília)
-scheduler.add_job(
-    enviar_motivacao,
-    trigger="cron",
-    hour=8,
-    minute=0,
-    timezone="America/Sao_Paulo"
-)
-
-# Job de teste único (1 minuto)
-scheduler.add_job(
-    enviar_motivacao,
-    trigger="date",
-    run_date=datetime.now() + timedelta(minutes=1)
-)
-
-# ─── FLUXO DE PEDIDOS ───────────────────────────────────────────────────────────
-def tratar_fluxo_pedido(phone, msg):
-    estado = estados.get(phone)
-    pedido = pedidos.get(phone, {})
-
-    # 1) Pedido inicial
-    if estado is None and msg.lower().startswith("quero"):
-        parts = msg.lower().split()
-        qt = int(next((w for w in parts if w.isdigit()), 1))
-        for key in ["branquinho","lava roupas","amaciante","desinfetante","água sanitária","alvejante","detergente","álcool perfumado","kit"]:
-            if key in msg.lower():
-                item = key.title()
-                break
-        else:
-            item = "Produto"
-        pedidos[phone] = {"item": item, "qt": qt}
-        estados[phone] = "aguardando_data"
-        save_json(PEDIDOS_FILE, pedidos); save_json(ESTADOS_FILE, estados)
-        return ("asked_date", f"Ok, {qt} {item}. Para qual data você deseja a entrega?", None)
-
-    # 2) Data
-    if estado == "aguardando_data":
-        pedidos[phone]["data"] = msg
-        estados[phone] = "aguardando_bairro"
-        save_json(PEDIDOS_FILE, pedidos); save_json(ESTADOS_FILE, estados)
-        return ("asked_bairro", f"Perfeito. Em qual bairro devo entregar no dia {msg}?", None)
-
-    # 3) Bairro
-    if estado == "aguardando_bairro":
-        pedidos[phone]["bairro"] = msg
-        estados[phone] = "aguardando_urgencia"
-        save_json(PEDIDOS_FILE, pedidos); save_json(ESTADOS_FILE, estados)
-        return ("asked_urgencia", "Ótimo! Essa entrega é urgente? (sim/não)", None)
-
-    # 4) Urgência e finalização
-    if estado == "aguardando_urgencia":
-        urg = msg.lower() in ("sim","s","urgente")
-        p = pedidos.pop(phone)
-        estados.pop(phone, None)
-        save_json(PEDIDOS_FILE, pedidos); save_json(ESTADOS_FILE, estados)
-
-        nome_cli = clientes.get(phone, phone)
-        # O prompt ao GPT incluirá o aviso de caminho automaticamente
-        return (
-            "order_confirmed",
-            None,  # deixa o GPT gerar a mensagem final
-            None
-        )
-
-    return None
+def proxima_pergunta(faltando_key: str) -> str:
+    textos = {
+        "item":    "Qual produto você gostaria de pedir? Ex: Lava roupas, Branquinho…",
+        "qt":      "Quantas unidades você deseja?",
+        "data":    "Para qual data você quer a entrega?",
+        "bairro":  "Em qual bairro devo entregar?",
+        "urgente": "Essa entrega é urgente? (sim/não)"
+    }
+    return textos.get(faltando_key, "Pode me dar mais detalhes?")
 
 # ─── ROTAS ─────────────────────────────────────────────────────────────────────
-@app.route("/", methods=["GET"])
-def home():
-    return "Bot do WhatsApp está rodando!", 200
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data     = request.get_json()
-    phone    = data.get("phone")
-    raw_name = data.get("senderName", "")
-    msg      = data.get("text", {}).get("message", "").strip()
-    is_group = data.get("isGroup", False)
-
-    logging.info("✉️ Webhook recebido"); logging.info(f"📦 Payload: {data}")
-
-    if not phone or not msg or data.get("fromMe", False):
+    data  = request.get_json()
+    phone = data.get("phone")
+    msg   = data.get("text",{}).get("message","").strip()
+    if not phone or not msg or data.get("fromMe",False):
         return jsonify({"status":"ignored"})
 
-    # prevenir loop
-    last = estados.get(f"{phone}_last_msg")
-    if last == msg.lower():
-        return jsonify({"status":"loop_prevented"})
-    estados[f"{phone}_last_msg"] = msg.lower()
+    logging.info("✉️ Webhook recebido")
+    logging.info(f"📦 Payload: {data}")
 
-    # coleta nome
-    nome = clientes.get(phone)
-    est_nome = estados.get(phone)
-    if not nome and est_nome != "aguardando_nome":
-        send_whatsapp_message(phone, "Olá! Pra começarmos, qual é o seu nome? 😊")
-        estados[phone] = "aguardando_nome"
-        save_json(ESTADOS_FILE, estados)
-        return jsonify({"status":"asked_name"})
-    if est_nome == "aguardando_nome":
-        clean = sanitize_name(msg.title())
-        if clean:
-            clientes[phone] = clean; save_json(CLIENTES_FILE, clientes)
-            send_whatsapp_message(phone, f"Obrigado, {clean}! 😊 Agora podemos continuar.")
-        else:
-            send_whatsapp_message(phone, "Desculpe, não entendi. Pode dizer seu nome de forma mais simples?")
-            return jsonify({"status":"asked_name"})
-        estados.pop(phone, None); save_json(ESTADOS_FILE, estados)
+    # coleta nome simples
+    if phone not in clientes:
+        send_whatsapp_message(phone, "Olá! Pra começarmos, qual é o seu nome?")
+        clientes[phone] = None
+        save_json(CUSTOMER_FILE, clientes)
+        estados.pop(phone, None)
+        return jsonify({"status":"ask_name"})
+    if clientes[phone] is None:
+        clientes[phone] = msg.title()
+        save_json(CUSTOMER_FILE, clientes)
+        send_whatsapp_message(phone, f"Obrigado, {clientes[phone]}! 😊 Agora vamos ao seu pedido.")
+        estados.pop(phone, None)
         return jsonify({"status":"name_saved"})
 
-    # fluxo pedido
-    fluxo = tratar_fluxo_pedido(phone, msg)
-    if fluxo:
-        status, resp_cli, resp_grp = fluxo
-        if resp_cli:
-            send_whatsapp_message(phone, resp_cli)
-        # para finalização, delega ao GPT a mensagem completa
-        if status == "order_confirmed":
-            # montar prompt para GPT, incluindo instrução de aviso de caminho
-            catalogo = (
-                "Catálogo (5L): Lava roupas R$35, Amaciante R$35, Desinfetante R$30, "
-                "Água sanitária R$25, Alvejante R$30, Detergente R$30, Álcool perfumado R$40, Branquinho R$40; Kit R$145."
-            )
-            system_content = (
-                f"Você é atendente da BG Produtos de Limpeza. Fale como o Thiago: "
-                "seja direto, simpático e profissional. "
-                f"{catalogo} "
-                "Quando confirmar um pedido, inicie com '✅ Pedido confirmado:' "
-                "e inclua sempre: 'No dia <DATA>, avisaremos quando estivermos a caminho de <BAIRRO>'."
-            )
-            try:
-                completion = openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role":"system","content":system_content},
-                        {"role":"user","content":f"Finalize meu pedido: {json.dumps(p, ensure_ascii=False)}"}
-                    ]
-                )
-                final_msg = completion.choices[0].message.content.strip()
-            except Exception as e:
-                logging.error(f"Erro no GPT: {e}")
-                final_msg = "Pedido confirmado! No dia combinado avisaremos quando estivermos a caminho de seu bairro."
-            send_whatsapp_message(phone, final_msg)
-            send_group_message(
-                f"📅 Entrega agendada: {clientes.get(phone).title()} pediu "
-                f"{p['qt']}x {p['item']} em {p['bairro']} para {p['data']}"
-                f"{' (URGENTE)' if p.get('urgente') else ''}."
-            )
-        elif resp_grp:
-            send_group_message(resp_grp)
-        return jsonify({"status":status})
-
-    # atendimento normal via GPT
-    saudacao = f"Olá, {clientes.get(phone,'')}! 😊"
-    catalogo = (
-        "Catálogo (5L): Lava roupas R$35, Amaciante R$35, Desinfetante R$30, "
-        "Água sanitária R$25, Alvejante R$30, Detergente R$30, Álcool perfumado R$40, Branquinho R$40; Kit R$145."
-    )
-    system_content = (
-        f"{saudacao} Você é um atendente humano da BG Produtos de Limpeza. "
-        "Fale como o Thiago: seja direto, simpático e profissional. "
-        f"{catalogo}"
-    )
-    try:
-        completion = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role":"system","content":system_content},
-                {"role":"user","content":msg}
-            ]
-        )
-        resposta = completion.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"Erro no GPT: {e}")
-        resposta = "Desculpe, estamos com instabilidade. Tente novamente mais tarde."
-    if is_group:
-        send_group_message(resposta)
+    # checa se estamos esperando um slot específico
+    user_state = estados.get(phone, {})
+    esperando = user_state.get("esperando")
+    if esperando:
+        # atualiza o slot com a resposta livre
+        val = msg.lower() in ("sim","s","urgente") if esperando=="urgente" else msg
+        user_state[esperando] = val
+        user_state.pop("esperando")
+        # verifica o que ainda falta
+        faltando = [k for k in ("item","qt","data","bairro","urgente")
+                    if k not in user_state or user_state[k] in (None,"",False)]
+        if faltando:
+            prox = faltando[0]
+            user_state["esperando"] = prox
+            estados[phone] = user_state
+            save_json(STATE_FILE, estados)
+            send_whatsapp_message(phone, proxima_pergunta(prox))
+            return jsonify({"status":"ask_slot"})
+        # todos slots preenchidos
+        slots = user_state
+        estados.pop(phone)
     else:
-        send_whatsapp_message(phone, resposta)
+        # primeira vez: extrai todos de uma vez
+        slots = extrair_slots(msg)
+        faltando = slots.pop("faltando", [])
+        if faltando:
+            prox = faltando[0]
+            slots["esperando"] = prox
+            estados[phone] = slots
+            save_json(STATE_FILE, estados)
+            send_whatsapp_message(phone, proxima_pergunta(prox))
+            return jsonify({"status":"ask_slot"})
 
-    save_json(ESTADOS_FILE, estados)
-    return jsonify({"status":"ok"})
+    # aqui, slots tem item, qt, data, bairro, urgente completos
+    nome = clientes[phone]
+    msg_cli = (
+        f"✅ Pedido confirmado: {slots['qt']}x {slots['item']} para {slots['data']} em {slots['bairro']}"
+        + (" (URGENTE)" if slots["urgente"] else "")
+        + ".\nNo dia combinado, avisaremos quando estivermos a caminho do seu bairro."
+    )
+    send_whatsapp_message(phone, msg_cli)
 
-if __name__ == "__main__":
+    grp = (
+        f"📅 Entrega agendada: {nome} pediu {slots['qt']}x {slots['item']} "
+        f"em {slots['bairro']} para {slots['data']}"
+        + (" (URGENTE)" if slots["urgente"] else "")
+    )
+    send_group_message(grp)
+
+    return jsonify({"status":"order_complete"})
+
+@app.route("/", methods=["GET"])
+def home():
+    return "Bot rodando!", 200
+
+if __name__=="__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT",5000)))
