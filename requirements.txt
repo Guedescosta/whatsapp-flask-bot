@@ -2,3 +2,4 @@ flask==2.3.2
 requests==2.32.3
 gunicorn==21.2.0
 openai==1.23.6
+APScheduler>=3.9.0
