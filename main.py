@@ -5,6 +5,7 @@ import requests
 import httpx
 import json
 import re
+from datetime import datetime, timedelta
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -45,7 +46,7 @@ def save_json(path, data):
 clientes = load_json(CLIENTES_FILE)   # {"55419...": "Joana"}
 estados  = load_json(ESTADOS_FILE)    # {"55419...": "aguardando_nome"}
 
-# ─── UTILITÁRIAS ────────────────────────────────────────────────────────────────
+# ─── UTILITÁRIAS ───────────────────────────────────────────────────────────────
 def sanitize_name(raw: str) -> str:
     name = re.split(r"[\d–\-]", raw)[0].strip()
     return name if re.fullmatch(r"[A-Za-zÀ-ÿ ]+", name) else ""
@@ -73,13 +74,20 @@ def enviar_motivacao():
     frase = "“Cada desafio superado no código é um passo a mais rumo ao seu objetivo: continue codando com confiança!”"
     send_group_message(frase)
 
-# Agenda diária de motivação às 08:00 Brasília
+# Cron diário de motivação às 08:00 (Brasília)
 scheduler.add_job(
     enviar_motivacao,
     trigger="cron",
     hour=8,
     minute=0,
     timezone="America/Sao_Paulo"
+)
+
+# Job de teste único para daqui a 1 minuto
+scheduler.add_job(
+    enviar_motivacao,
+    trigger="date",
+    run_date=datetime.now() + timedelta(minutes=1)
 )
 
 # ─── ROTAS ─────────────────────────────────────────────────────────────────────
@@ -124,8 +132,10 @@ def webhook():
             save_json(CLIENTES_FILE, clientes)
             send_whatsapp_message(phone, f"Obrigado, {clean}! 😊 Agora podemos continuar.")
         else:
-            send_whatsapp_message(phone,
-                "Desculpe, não consegui entender. Pode me dizer seu nome de forma mais simples?")
+            send_whatsapp_message(
+                phone,
+                "Desculpe, não consegui entender. Pode me dizer seu nome de forma mais simples?"
+            )
             return jsonify({"status": "asked_name"})
 
         estados.pop(phone)
@@ -137,8 +147,7 @@ def webhook():
     catalogo = (
         "Catálogo de produtos (5L): Lava roupas R$35, Amaciante R$35, "
         "Desinfetante R$30, Água sanitária R$25, Alvejante sem cloro R$30, "
-        "Detergente R$30, Álcool perfumado R$40, Branquinho R$40; "
-        "Kit 5 produtos R$145."
+        "Detergente R$30, Álcool perfumado R$40, Branquinho R$40; Kit 5 produtos R$145."
     )
     system_content = (
         f"{saudacao} Você é um atendente humano da BG Produtos de Limpeza. "
@@ -164,7 +173,6 @@ def webhook():
     else:
         send_whatsapp_message(phone, resposta)
 
-    # Salvar estados persistidos
     save_json(ESTADOS_FILE, estados)
     return jsonify({"status": "ok"})
 
