@@ -33,6 +33,7 @@ scheduler.start()
 # ─── ARMAZENAMENTO SIMPLES EM JSON ──────────────────────────────────────────────
 CLIENTES_FILE = "clientes.json"
 ESTADOS_FILE  = "estados.json"
+PEDIDOS_FILE  = "pedidos.json"
 
 def load_json(path):
     try:
@@ -45,8 +46,9 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-clientes = load_json(CLIENTES_FILE)   # {"55419...": "Joana"}
-estados  = load_json(ESTADOS_FILE)    # {"55419...": "aguardando_nome"}
+clientes = load_json(CLIENTES_FILE)   # { phone: nome }
+estados  = load_json(ESTADOS_FILE)    # { phone: estado_atual }
+pedidos  = load_json(PEDIDOS_FILE)    # { phone: pedido_em_andamento }
 
 # ─── UTILITÁRIAS ───────────────────────────────────────────────────────────────
 def sanitize_name(raw: str) -> str:
@@ -92,6 +94,82 @@ scheduler.add_job(
     run_date=datetime.now() + timedelta(minutes=1)
 )
 
+# ─── FLUXO DE PEDIDOS ───────────────────────────────────────────────────────────
+def tratar_fluxo_pedido(phone, msg):
+    estado = estados.get(phone)
+    pedido = pedidos.get(phone, {})
+
+    # 1) Detecta pedido inicial: "quero X Item"
+    if estado is None and msg.lower().startswith("quero"):
+        parts = msg.lower().split()
+        qt = int(next((w for w in parts if w.isdigit()), 1))
+        # identifica o item entre palavras-chave
+        for key in ["branquinho", "lava roupas", "amaciante", "desinfetante", "água sanitária", "alvejante", "detergente", "álcool perfumado", "kit"]:
+            if key in msg.lower():
+                item = key.title()
+                break
+        else:
+            item = "Produto"
+        pedidos[phone] = {"item": item, "qt": qt}
+        estados[phone] = "aguardando_data"
+        save_json(PEDIDOS_FILE, pedidos)
+        save_json(ESTADOS_FILE, estados)
+        return (
+            "asked_date",
+            f"Ok, {qt} {item}. Para qual data você deseja a entrega?",
+            None
+        )
+
+    # 2) Pergunta data
+    if estado == "aguardando_data":
+        pedidos[phone]["data"] = msg
+        estados[phone] = "aguardando_bairro"
+        save_json(PEDIDOS_FILE, pedidos)
+        save_json(ESTADOS_FILE, estados)
+        return (
+            "asked_bairro",
+            f"Perfeito. Em qual bairro devo entregar no dia {msg}?",
+            None
+        )
+
+    # 3) Pergunta bairro
+    if estado == "aguardando_bairro":
+        pedidos[phone]["bairro"] = msg
+        estados[phone] = "aguardando_urgencia"
+        save_json(PEDIDOS_FILE, pedidos)
+        save_json(ESTADOS_FILE, estados)
+        return (
+            "asked_urgencia",
+            "Ótimo! Essa entrega é urgente? (sim/não)",
+            None
+        )
+
+    # 4) Pergunta urgência e finaliza
+    if estado == "aguardando_urgencia":
+        urg = msg.lower() in ("sim", "s", "urgente")
+        pedidos[phone]["urgente"] = urg
+        p = pedidos.pop(phone)
+        estados.pop(phone, None)
+        save_json(PEDIDOS_FILE, pedidos)
+        save_json(ESTADOS_FILE, estados)
+
+        nome_cli = clientes.get(phone, phone)
+        texto_cli = (
+            f"✅ Pedido confirmado:\n"
+            f"- {p['qt']}x {p['item']}\n"
+            f"- Data: {p['data']}\n"
+            f"- Bairro: {p['bairro']}\n"
+            f"- Urgente: {'Sim' if p['urgente'] else 'Não'}"
+        )
+        texto_grp = (
+            f"📅 Entrega agendada:\n"
+            f"{nome_cli} pediu {p['qt']}x {p['item']} em {p['bairro']} "
+            f"para {p['data']}{' (URGENTE)' if urg else ''}."
+        )
+        return ("order_confirmed", texto_cli, texto_grp)
+
+    return None
+
 # ─── ROTAS ─────────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def home():
@@ -108,26 +186,25 @@ def webhook():
     logging.info("✉️ Webhook recebido")
     logging.info(f"📦 Payload: {data}")
 
+    # validações iniciais
     if not phone or not msg or data.get("fromMe", False):
         return jsonify({"status": "ignored"})
 
-    # Prevenção de loop
+    # prevenção de loop
     last = estados.get(f"{phone}_last_msg")
     if last == msg.lower():
         return jsonify({"status": "loop_prevented"})
     estados[f"{phone}_last_msg"] = msg.lower()
 
-    # Fluxo de coleta de nome
+    # fluxo de coleta de nome
     nome = clientes.get(phone)
-    estado = estados.get(phone)
-
-    if not nome and estado != "aguardando_nome":
+    estado_nome = estados.get(phone)
+    if not nome and estado_nome != "aguardando_nome":
         send_whatsapp_message(phone, "Olá! Pra começarmos, qual é o seu nome? 😊")
         estados[phone] = "aguardando_nome"
         save_json(ESTADOS_FILE, estados)
         return jsonify({"status": "asked_name"})
-
-    if estado == "aguardando_nome":
+    if estado_nome == "aguardando_nome":
         clean = sanitize_name(msg.title())
         if clean:
             clientes[phone] = clean
@@ -139,13 +216,21 @@ def webhook():
                 "Desculpe, não consegui entender. Pode me dizer seu nome de forma mais simples?"
             )
             return jsonify({"status": "asked_name"})
-
-        estados.pop(phone)
+        estados.pop(phone, None)
         save_json(ESTADOS_FILE, estados)
         return jsonify({"status": "name_saved"})
 
-    # Atendimento normal
-    saudacao = f"Olá, {clientes[phone]}! 😊"
+    # fluxo de pedido
+    fluxo = tratar_fluxo_pedido(phone, msg)
+    if fluxo:
+        status, resp_cli, resp_grp = fluxo
+        send_whatsapp_message(phone, resp_cli)
+        if resp_grp:
+            send_group_message(resp_grp)
+        return jsonify({"status": status})
+
+    # atendimento normal com GPT
+    saudacao = f"Olá, {clientes.get(phone, '')}! 😊"
     catalogo = (
         "Catálogo de produtos (5L): Lava roupas R$35, Amaciante R$35, "
         "Desinfetante R$30, Água sanitária R$25, Alvejante sem cloro R$30, "
@@ -177,3 +262,10 @@ def webhook():
 
     save_json(ESTADOS_FILE, estados)
     return jsonify({"status": "ok"})
+
+if __name__ == "__main__":
+    app.run(
+        debug=True,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 5000))
+    )
