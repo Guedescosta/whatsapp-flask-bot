@@ -27,6 +27,8 @@ openai_client = OpenAI(
 
 # APScheduler para jobs em background
 scheduler = BackgroundScheduler()
+logging.info("🔄 Iniciando APScheduler...")
+scheduler.start()
 
 # ─── ARMAZENAMENTO SIMPLES EM JSON ──────────────────────────────────────────────
 CLIENTES_FILE = "clientes.json"
@@ -175,11 +177,3 @@ def webhook():
 
     save_json(ESTADOS_FILE, estados)
     return jsonify({"status": "ok"})
-
-if __name__ == "__main__":
-    scheduler.start()
-    app.run(
-        debug=True,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 5000))
-    )
