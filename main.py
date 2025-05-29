@@ -1,43 +1,49 @@
 from flask import Flask, request, jsonify
-import os
-import logging
-import requests
-import httpx
-import json
+import os, logging, requests, json, httpx
 from datetime import datetime, timedelta
-from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
+from openai import OpenAI
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ─── CONFIGURAÇÃO ─────────────────────────────────────────────────────────────
+# ─── CONFIGURAÇÃO ─────────────────────────────────────────────────────────
 ZAPI_INSTANCE_ID  = os.getenv("ZAPI_INSTANCE_ID")
 ZAPI_TOKEN        = os.getenv("ZAPI_TOKEN")
 ZAPI_CLIENT_TOKEN = os.getenv("ZAPI_CLIENT_TOKEN")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
-ZAPI_GROUP_ID     = os.getenv("ZAPI_GROUP_ID")  # ID do grupo “Vendas - IA”
+ZAPI_GROUP_ID     = os.getenv("ZAPI_GROUP_ID")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client())
 
-# APScheduler
-scheduler = BackgroundScheduler()
-logging.info("🔄 Iniciando APScheduler...")
-scheduler.start()
+# ─── TEMPLATES PARAMETRIZADOS ───────────────────────────────────────────────
+TEMPLATES = {
+    "ask_name":            "Olá! Pra começarmos, qual é o seu nome?",
+    "greet_after_name":    "Obrigado, {nome}! 😊 Vamos ao seu pedido.",
+    "ask_slot":            "{pergunta}",
+    "confirm_order":       "✅ Pedido confirmado: {qt}x {item} para {data} em {bairro}{urgente}. Avisaremos quando estivermos a caminho.",
+    "group_notification":  "📅 {nome} pediu {qt}x {item} em {bairro} para {data}{urgente}.",
+    "delivery_fallback":   "Claro, {nome}, estarei aí por volta de {hora_prevista}. Precisa de mais alguma coisa?",
+    "catalogue":           "{catalogo_text}"  # texto gerado dinamicamente
+}
 
-def enviar_motivacao():
-    frase = "“Cada desafio superado no código é um passo a mais rumo ao seu objetivo: continue codando com confiança!”"
-    if ZAPI_GROUP_ID:
-        send_whatsapp_message(ZAPI_GROUP_ID, frase)
+# ─── CATÁLOGO (mini-BD) ─────────────────────────────────────────────────────
+CATALOGUE_FILE = "catalogo.json"
+def load_catalogue():
+    try:
+        with open(CATALOGUE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+catalogue = load_catalogue()
 
-scheduler.add_job(enviar_motivacao, trigger="cron",
-                  hour=8, minute=0, timezone="America/Sao_Paulo")
-scheduler.add_job(enviar_motivacao, trigger="date",
-                  run_date=datetime.now() + timedelta(minutes=1))
+def get_catalogue_text():
+    lines = [f"- {item}: R${price}" for item, price in catalogue.items()]
+    return "Aqui está nosso catálogo de produtos de limpeza de 5L:\n" + "\n".join(lines)
 
-# ─── ARMAZENAMENTO ─────────────────────────────────────────────────────────────
-STATE_FILE   = "estados.json"   # guarda slots e estados de usuário
-CUSTOMER_FILE= "clientes.json"
+# ─── ARMAZENAMENTO DE ESTADO ────────────────────────────────────────────────
+STATE_FILE    = "estados.json"
+CUSTOMER_FILE = "clientes.json"
 
 def load_json(path):
     try:
@@ -50,132 +56,126 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-estados   = load_json(STATE_FILE)    # { phone: {slots..., "esperando": key} }
-clientes  = load_json(CUSTOMER_FILE) # { phone: "Nome" }
+estados  = load_json(STATE_FILE)
+clientes = load_json(CUSTOMER_FILE)
 
-# ─── UTILITÁRIAS ───────────────────────────────────────────────────────────────
-def send_whatsapp_message(phone: str, text: str):
+# ─── UTILITÁRIAS ───────────────────────────────────────────────────────────
+def render(key, **params):
+    text = TEMPLATES[key]
+    return text.format(**params)
+
+def send_whatsapp_message(phone, text):
     url = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_TOKEN}/send-text"
     headers = {"Content-Type": "application/json", "Client-Token": ZAPI_CLIENT_TOKEN}
     try:
-        r = requests.post(url, json={"phone":phone,"message":text,"type":"text"}, headers=headers)
+        r = requests.post(url, json={"phone":phone, "message":text, "type":"text"}, headers=headers)
         r.raise_for_status()
         logging.info(f"✅ Mensagem enviada para {phone}: {r.text}")
     except Exception as e:
         logging.error(f"❌ Falha ao enviar para {phone}: {e}")
 
-def send_group_message(text: str):
+def send_group_message(text):
     if ZAPI_GROUP_ID:
         send_whatsapp_message(ZAPI_GROUP_ID, text)
 
-def extrair_slots(msg: str) -> dict:
-    """
-    Usa GPT para extrair item, qt, data, bairro, urgente e lista de faltando.
-    """
-    prompt = f"""
-Você é um parser de pedidos. Retorne apenas JSON com:
-- item (string)
-- qt (inteiro)
-- data (string)
-- bairro (string)
-- urgente (true/false)
-- faltando: lista de chaves não detectadas
-Exemplo de saída:
-{{"item":"Lava roupas","qt":1,"data":"amanhã","bairro":"Centro","urgente":false,"faltando":[]}}
-Frase do cliente: "{msg}"
-"""
-    res = openai_client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role":"system","content":prompt}]
-    )
-    return json.loads(res.choices[0].message.content)
+# ─── AGENDAMENTO ────────────────────────────────────────────────────────────
+scheduler = BackgroundScheduler()
+scheduler.start()
 
-def proxima_pergunta(faltando_key: str) -> str:
-    textos = {
-        "item":    "Qual produto você gostaria de pedir? Ex: Lava roupas, Branquinho…",
-        "qt":      "Quantas unidades você deseja?",
-        "data":    "Para qual data você quer a entrega?",
-        "bairro":  "Em qual bairro devo entregar?",
-        "urgente": "Essa entrega é urgente? (sim/não)"
+def enviar_motivacao():
+    frase = "Cada desafio superado no código é um passo a mais rumo ao seu objetivo: continue codando com confiança!"
+    send_group_message(frase)
+
+scheduler.add_job(enviar_motivacao, trigger="cron", hour=8, minute=0, timezone="America/Sao_Paulo")
+
+# ─── PARSER DE SLOTS ───────────────────────────────────────────────────────
+import re
+
+def extrair_slots(msg):
+    # quick regex fallback for item, qt e data
+    qt_match = re.search(r"(\d+)", msg)
+    item = next((i for i in catalogue if i.lower() in msg.lower()), None)
+    data = "amanhã" if "amanhã" in msg.lower() else None
+    return {
+        "item": item,
+        "qt": int(qt_match.group(1)) if qt_match else None,
+        "data": data,
+        "bairro": None,
+        "urgente": "urgente" in msg.lower(),
+        "faltando": [k for k,v in {
+            "item": item,
+            "qt": qt_match,
+            "data": data
+        }.items() if not v]
     }
-    return textos.get(faltando_key, "Pode me dar mais detalhes?")
 
-# ─── ROTAS ─────────────────────────────────────────────────────────────────────
+# ─── PERGUNTAS POR SLOTS ──────────────────────────────────────────────────
+SLOT_QUESTIONS = {
+    "item":   "Qual produto você gostaria de pedir?",
+    "qt":     "Quantas unidades?",
+    "data":   "Para qual data você quer a entrega?",
+    "bairro": "Em qual bairro?",
+    "urgente":"Essa entrega é urgente? (sim/não)"
+}
+
+# ─── ROTAS ────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data  = request.get_json()
     phone = data.get("phone")
-    msg   = data.get("text",{}).get("message","").strip()
-    if not phone or not msg or data.get("fromMe",False):
-        return jsonify({"status":"ignored"})
+    msg   = data.get("text",{}).get("message","" ).strip()
+    if not phone or not msg or data.get("fromMe"): return jsonify({"status":"ignored"})
 
-    logging.info("✉️ Webhook recebido")
-    logging.info(f"📦 Payload: {data}")
-
-    # coleta nome simples
-    if phone not in clientes:
-        send_whatsapp_message(phone, "Olá! Pra começarmos, qual é o seu nome?")
-        clientes[phone] = None
+    # fluxo de pergunta de nome
+    if phone not in clientes or not clientes[phone].get("nome"):
+        send_whatsapp_message(phone, render("ask_name"))
+        clientes[phone] = {"nome":None, "pedido":{}}
         save_json(CUSTOMER_FILE, clientes)
-        estados.pop(phone, None)
         return jsonify({"status":"ask_name"})
-    if clientes[phone] is None:
-        clientes[phone] = msg.title()
+    if clientes[phone]["nome"] is None:
+        clientes[phone]["nome"] = msg.title()
         save_json(CUSTOMER_FILE, clientes)
-        send_whatsapp_message(phone, f"Obrigado, {clientes[phone]}! 😊 Agora vamos ao seu pedido.")
-        estados.pop(phone, None)
+        send_whatsapp_message(phone, render("greet_after_name", nome=clientes[phone]["nome"]))
+        # enviar catálogo
+        send_whatsapp_message(phone, render("catalogue", catalogo_text=get_catalogue_text()))
         return jsonify({"status":"name_saved"})
 
-    # checa se estamos esperando um slot específico
-    user_state = estados.get(phone, {})
-    esperando = user_state.get("esperando")
-    if esperando:
-        val = msg.lower() in ("sim","s","urgente") if esperando=="urgente" else msg
-        user_state[esperando] = val
-        user_state.pop("esperando")
-        faltando = [k for k in ("item","qt","data","bairro","urgente")
-                    if k not in user_state or user_state[k] in (None,"",False)]
-        if faltando:
-            prox = faltando[0]
-            user_state["esperando"] = prox
-            estados[phone] = user_state
-            save_json(STATE_FILE, estados)
-            send_whatsapp_message(phone, proxima_pergunta(prox))
-            return jsonify({"status":"ask_slot"})
-        slots = user_state
-        estados.pop(phone)
+    # fallback de status de entrega
+    last = estados.get(phone,{}).get("pedido_confirmado")
+    if last and any(w in msg.lower() for w in ["amanhã","entrega","chega"]):
+        hora = (datetime.now()+timedelta(hours=2)).strftime("%Hh%M")
+        send_whatsapp_message(phone, render("delivery_fallback", nome=clientes[phone]["nome"], hora_prevista=hora))
+        return jsonify({"status":"delivery_status"})
+
+    # slot filling
+    state = estados.get(phone,{})
+    if state.get("esperando"):
+        key = state.pop("esperando")
+        state[key] = msg.lower() in ("sim","s") if key=="urgente" else msg
+        missing = [k for k in STATE_KEYS if not state.get(k)]
+        if missing:
+            nxt = missing[0]; state["esperando"] = nxt
+            estados[phone] = state; save_json(STATE_FILE, estados)
+            send_whatsapp_message(phone, SLOT_QUESTIONS[nxt]); return jsonify({"status":"ask_slot"})
+        slots = state; estados.pop(phone)
     else:
         slots = extrair_slots(msg)
-        faltando = slots.pop("faltando", [])
-        if faltando:
-            prox = faltando[0]
-            slots["esperando"] = prox
-            estados[phone] = slots
-            save_json(STATE_FILE, estados)
-            send_whatsapp_message(phone, proxima_pergunta(prox))
-            return jsonify({"status":"ask_slot"})
+        if slots.get("faltando"):
+            nxt = slots["faltando"][0]; slots["esperando"]=nxt
+            estados[phone] = slots; save_json(STATE_FILE, estados)
+            send_whatsapp_message(phone, SLOT_QUESTIONS[nxt]); return jsonify({"status":"ask_slot"})
 
-    # confirmação de pedido
-    nome = clientes[phone]
-    msg_cli = (
-        f"✅ Pedido confirmado: {slots['qt']}x {slots['item']} para {slots['data']} em {slots['bairro']}"
-        + (" (URGENTE)" if slots['urgente'] else "")
-        + ".\nNo dia combinado, avisaremos quando estivermos a caminho do seu bairro."
-    )
-    send_whatsapp_message(phone, msg_cli)
-
-    grp = (
-        f"📅 Entrega agendada: {nome} pediu {slots['qt']}x {slots['item']} "
-        f"em {slots['bairro']} para {slots['data']}"
-        + (" (URGENTE)" if slots['urgente'] else "")
-    )
+    # confirmar pedido
+    nome = clientes[phone]["nome"]
+    urgente_txt = " (URGENTE)" if slots["urgente"] else ""
+    send_whatsapp_message(phone, render("confirm_order", **slots, urgente=urgente_txt))
+    # notificar grupo
+    estados[phone] = {"pedido_confirmado":slots}
+    grp = render("group_notification", nome=nome, **slots, urgente=urgente_txt)
     send_group_message(grp)
-
     return jsonify({"status":"order_complete"})
 
 @app.route("/", methods=["GET"])
-def home():
-    return "Bot rodando!", 200
+def home(): return "Bot rodando!",200
 
-if __name__=="__main__":
-    app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT",5000)))
+if __name__=="__main__": app.run(host="0.0.0.0", port=int(os.getenv("PORT",5000)), debug=True)
