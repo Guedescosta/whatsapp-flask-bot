@@ -37,12 +37,14 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 # memória persistente
-tates = load_json(STATE_FILE)
+states = load_json(STATE_FILE)
 customers = load_json(CUSTOMER_FILE)
 
 # Z-API send helper
 headers = {"Content-Type": "application/json", "Client-Token": ZAPI_CLIENT_TOKEN}
 def send_whatsapp(phone, text):
+    # DEBUG: log outgoing message details
+    print(f"[DEBUG] send_whatsapp() -> phone: {phone}, text: {text}")
     url = (
         f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}"
         f"/token/{ZAPI_TOKEN}/send-text"
@@ -63,6 +65,7 @@ CATALOG = (
 
 # extrai slots
 def parse_order(msg):
+    print(f"[DEBUG] parse_order() -> msg: {msg}")
     prompt = (
         "Você é um vendedor: extraia item, qt, data, bairro e urgente. "
         "Se faltar, inclua 'faltando':[...] no JSON."\
@@ -72,7 +75,9 @@ def parse_order(msg):
         model="gpt-3.5-turbo",
         messages=[{"role":"system","content":prompt}],
     )
-    return json.loads(res.choices[0].message.content)
+    parsed = json.loads(res.choices[0].message.content)
+    print(f"[DEBUG] parse_order() -> parsed: {parsed}")
+    return parsed
 
 # perguntas por campo
 def next_question(field):
@@ -84,19 +89,23 @@ def next_question(field):
         "address":"Endereço completo (Rua, número)?",
         "urgent":  "É urgente? (sim/não)",
     }
-    return texts.get(field, "Pode detalhar? 🧐")
+    question = texts.get(field, "Pode detalhar? 🧐")
+    print(f"[DEBUG] next_question() -> field: {field}, question: {question}")
+    return question
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data  = request.get_json(force=True, silent=True) or {}
     phone = data.get("phone")
     text  = (data.get("text") or {}).get("message",""").strip()
+    print(f"[DEBUG] webhook() -> received data: {data}")
     if not phone or not text or data.get("fromMe"):
+        print(f"[DEBUG] webhook() -> ignored phone/text/fromMe: {phone}, {text}, {data.get('fromMe')}")
         return jsonify(status="ignored")
 
     logging.info("Webhook recebido: %s", data)
-
     state = states.get(phone, {})
+    print(f"[DEBUG] webhook() -> current state for {phone}: {state}")
 
     # 1) qualificação inicial
     if phone not in customers:
@@ -115,6 +124,7 @@ def webhook():
     # 2) pedido de catálogo/informação
     lower = text.lower()
     if any(k in lower for k in ["catálogo","promoção","quais produtos","lista"]):
+        print(f"[DEBUG] webhook() -> sending catalog to {phone}")
         send_whatsapp(phone, CATALOG)
         return jsonify(status="sent_catalog")
 
@@ -128,10 +138,10 @@ def webhook():
 
     # 4) confirmação pendente
     if state.get("confirm_pending"):
+        print(f"[DEBUG] webhook() -> confirmation pending for {phone}")
         if lower.startswith("s"):
             summary = state.get("group_summary")
-            if summary and ZAPI_GROUP_ID:
-                send_whatsapp(ZAPI_GROUP_ID, summary)
+            send_whatsapp(ZAPI_GROUP_ID, summary) if summary and ZAPI_GROUP_ID else None
             send_whatsapp(phone, "Venda confirmada! Em breve avisaremos para entrega.")
         else:
             send_whatsapp(phone, "Claro, o que deseja ajustar no pedido?")
@@ -143,37 +153,34 @@ def webhook():
     if not state or state.get("waiting"):
         key = state.get("waiting")
         if key:
-            val = text if key!="urgent" else text.lower().startswith("s")
+            val = text if key != "urgent" else text.lower().startswith("s")
             state[key] = val
+            print(f"[DEBUG] webhook() -> collected {key}: {val}")
         else:
-            # extrair slots do pedido
             parsed  = parse_order(text)
             slots   = {k:parsed[k] for k in ["item","qt","data","bairro"] if k in parsed}
             missing = parsed.get("faltando", [])
             state = {**slots, **{"urgent":parsed.get("urgent",False)}}
-            if missing:
-                key = missing[0]
-            else:
-                key = None
-        # check missing/additional
+        # verificar campos faltantes
         fields = ["item","qt","data","bairro","address"]
-        if key or any(f not in state for f in fields if f!="address"):
-            ask = key or next(f for f in ["item","qt","data","bairro"] if f not in state)
+        miss = missing if 'missing' in locals() else [f for f in fields if f not in state]
+        if miss:
+            ask = miss[0]
             state["waiting"] = ask
             states[phone] = state
             save_json(STATE_FILE, states)
             send_whatsapp(phone, next_question(ask))
             return jsonify(status="ask_slot")
-        # next: address if not sample
-        if state.get("obs")!="ver no carro" and not state.get("address"):
+        if state.get("obs") != "ver no carro" and not state.get("address"):
             state["waiting"] = "address"
             states[phone] = state
             save_json(STATE_FILE, states)
             send_whatsapp(phone, next_question("address"))
             return jsonify(status="ask_address")
+
     # 6) todos os dados coletados: confirmar venda
-    name    = customers[phone]
-    obs     = state.get("obs", f"Pedido {state['qt']}x {state['item']}")
+    name = customers[phone]
+    obs = state.get("obs", f"Pedido {state['qt']}x {state['item']}")
     summary = (
         f"Dados da Cliente:\n"
         f"Nome: {name}\n"
@@ -182,10 +189,9 @@ def webhook():
         f"Data/Horário: {state.get('data')}\n"
         f"Obs: {obs}"
     )
+    print(f"[DEBUG] webhook() -> final summary: {summary}")
     send_whatsapp(phone, f"Perfeito, {name}! Confirmo o agendamento e já aviso quando estivermos a caminho. 😊")
-    # pendência de confirmar no grupo
-    state = {"confirm_pending":True, "group_summary":summary}
-    states[phone] = state
+    states[phone] = {"confirm_pending":True, "group_summary":summary}
     save_json(STATE_FILE, states)
     return jsonify(status="ask_confirm")
 
