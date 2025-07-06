@@ -97,7 +97,7 @@ def next_question(field):
 def webhook():
     data  = request.get_json(force=True, silent=True) or {}
     phone = data.get("phone")
-    text  = (data.get("text") or {}).get("message",""").strip()
+    text  = (data.get("text") or {}).get("message", "").strip()
     print(f"[DEBUG] webhook() -> received data: {data}")
     if not phone or not text or data.get("fromMe"):
         print(f"[DEBUG] webhook() -> ignored phone/text/fromMe: {phone}, {text}, {data.get('fromMe')}")
@@ -141,7 +141,8 @@ def webhook():
         print(f"[DEBUG] webhook() -> confirmation pending for {phone}")
         if lower.startswith("s"):
             summary = state.get("group_summary")
-            send_whatsapp(ZAPI_GROUP_ID, summary) if summary and ZAPI_GROUP_ID else None
+            if summary and ZAPI_GROUP_ID:
+                send_whatsapp(ZAPI_GROUP_ID, summary)
             send_whatsapp(phone, "Venda confirmada! Em breve avisaremos para entrega.")
         else:
             send_whatsapp(phone, "Claro, o que deseja ajustar no pedido?")
