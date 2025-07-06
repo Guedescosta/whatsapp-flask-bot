@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 ZAPI_INSTANCE_ID  = os.getenv("ZAPI_INSTANCE_ID")
 ZAPI_TOKEN        = os.getenv("ZAPI_TOKEN")
 ZAPI_CLIENT_TOKEN = os.getenv("ZAPI_CLIENT_TOKEN")
-ZAPI_GROUP_ID     = os.getenv("ZAPI_GROUP_ID")   # canal de vendas
+ZAPI_GROUP_ID     = os.getenv("ZAPI_GROUP_ID")  # canal de vendas
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 
 # arquivos de estado
@@ -24,7 +24,7 @@ CUSTOMER_FILE = "customers.json"
 httpx_client   = httpx.Client(timeout=10)
 openai_client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx_client)
 
-# carrega JSON ou retorna dict vazio
+# load/save JSON
 def load_json(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -32,20 +32,16 @@ def load_json(path):
     except:
         return {}
 
-# salva dict em JSON
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-# memória em disco
-states    = load_json(STATE_FILE)
+# memória persistente
+tates = load_json(STATE_FILE)
 customers = load_json(CUSTOMER_FILE)
 
-# envia mensagem via Z-API
-headers = {
-    "Content-Type": "application/json",
-    "Client-Token": ZAPI_CLIENT_TOKEN
-}
+# Z-API send helper
+headers = {"Content-Type": "application/json", "Client-Token": ZAPI_CLIENT_TOKEN}
 def send_whatsapp(phone, text):
     url = (
         f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}"
@@ -59,12 +55,18 @@ def send_whatsapp(phone, text):
     except Exception as e:
         logging.error(f"Failed send to {phone}: {e}")
 
-# extrai slots iniciais
+# catálogo estático
+CATALOG = (
+    "Promoção Kit 5x5L por R$135,00 (30 dias p/ pagar)!\n"
+    "Produtos: Sabão, Amaciante, Água sanitária, Desinfetante, Alvejante, Detergente, Veja Multiuso."
+)
+
+# extrai slots
 def parse_order(msg):
     prompt = (
-        "Você é um vendedor: extraia item, qt, data, bairro e urgente de forma natural. "
-        "Se faltar, retorne também faltando:[...] na lista.\n"
-        f"Mensagem: '{msg}'"
+        "Você é um vendedor: extraia item, qt, data, bairro e urgente. "
+        "Se faltar, inclua 'faltando':[...] no JSON."\
+        f"\nMensagem: '{msg}'"
     )
     res = openai_client.chat.completions.create(
         model="gpt-3.5-turbo",
@@ -72,104 +74,119 @@ def parse_order(msg):
     )
     return json.loads(res.choices[0].message.content)
 
-# texto para cada campo faltante
+# perguntas por campo
 def next_question(field):
     texts = {
-        "item":   "Qual produto você deseja?",
-        "qt":     "Quantas unidades?",
-        "data":   "Para qual data?",
-        "bairro": "Qual bairro?",
-        "urgente":"É urgente? (sim/não)",
+        "item":    "Qual produto deseja?",
+        "qt":      "Quantas unidades?",
+        "data":    "Para qual data e hora?",
+        "bairro":  "Qual bairro?",
+        "address":"Endereço completo (Rua, número)?",
+        "urgent":  "É urgente? (sim/não)",
     }
-    return texts.get(field, "Pode detalhar?")
+    return texts.get(field, "Pode detalhar? 🧐")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data  = request.get_json(force=True, silent=True) or {}
     phone = data.get("phone")
-    text  = (data.get("text") or {}).get("message","").strip()
-    # ignora sem número/texto ou mensagem própria
+    text  = (data.get("text") or {}).get("message",""").strip()
     if not phone or not text or data.get("fromMe"):
         return jsonify(status="ignored")
 
     logging.info("Webhook recebido: %s", data)
 
-    # passo 1: perguntar nome
+    state = states.get(phone, {})
+
+    # 1) qualificação inicial
     if phone not in customers:
         send_whatsapp(phone, "Olá! Pra começar, qual é seu nome?")
         customers[phone] = None
         save_json(CUSTOMER_FILE, customers)
         states.pop(phone, None)
         return jsonify(status="ask_name")
-
-    # passo 2: registrar nome
     if customers[phone] is None:
         customers[phone] = text.title()
         save_json(CUSTOMER_FILE, customers)
-        send_whatsapp(phone, f"Obrigado, {customers[phone]}! Vamos ao pedido.")
+        send_whatsapp(phone, f"Obrigado, {customers[phone]}! 😊 Posso ajudar com nosso Kit ou catálogo de produtos?")
         states.pop(phone, None)
         return jsonify(status="name_saved")
 
-    st = states.get(phone, {})
+    # 2) pedido de catálogo/informação
+    lower = text.lower()
+    if any(k in lower for k in ["catálogo","promoção","quais produtos","lista"]):
+        send_whatsapp(phone, CATALOG)
+        return jsonify(status="sent_catalog")
 
-    # confirmação pendente
-    if st.get("confirm_pending"):
-        if text.lower().startswith("s"):
-            summary = st.get("group_summary")
+    # 3) amostra no carro
+    if "ver no carro" in lower or "no carro" in lower:
+        send_whatsapp(phone, "Sem problema! Podemos levar amostras no carro. Qual seu endereço completo?")
+        state = {"obs":"ver no carro","waiting":"address"}
+        states[phone] = state
+        save_json(STATE_FILE, states)
+        return jsonify(status="ask_address")
+
+    # 4) confirmação pendente
+    if state.get("confirm_pending"):
+        if lower.startswith("s"):
+            summary = state.get("group_summary")
             if summary and ZAPI_GROUP_ID:
                 send_whatsapp(ZAPI_GROUP_ID, summary)
-            send_whatsapp(phone, "Venda confirmada! Obrigado 😊")
+            send_whatsapp(phone, "Venda confirmada! Em breve avisaremos para entrega.")
         else:
-            send_whatsapp(phone, "Tudo bem, o que deseja ajustar?")
-        states.pop(phone, None)
+            send_whatsapp(phone, "Claro, o que deseja ajustar no pedido?")
+        states.pop(phone)
         save_json(STATE_FILE, states)
         return jsonify(status="confirmation")
 
-    # coletar slots
-    if not st:
-        parsed  = parse_order(text)
-        missing = parsed.get("faltando", [])
-        slots   = {k: parsed[k] for k in ["item","qt","data","bairro","urgente"] if k in parsed}
-        if missing:
-            key = missing[0]
-            slots["waiting"] = key
-            states[phone] = slots
+    # 5) coleta de dados gerais
+    if not state or state.get("waiting"):
+        key = state.get("waiting")
+        if key:
+            val = text if key!="urgent" else text.lower().startswith("s")
+            state[key] = val
+        else:
+            # extrair slots do pedido
+            parsed  = parse_order(text)
+            slots   = {k:parsed[k] for k in ["item","qt","data","bairro"] if k in parsed}
+            missing = parsed.get("faltando", [])
+            state = {**slots, **{"urgent":parsed.get("urgent",False)}}
+            if missing:
+                key = missing[0]
+            else:
+                key = None
+        # check missing/additional
+        fields = ["item","qt","data","bairro","address"]
+        if key or any(f not in state for f in fields if f!="address"):
+            ask = key or next(f for f in ["item","qt","data","bairro"] if f not in state)
+            state["waiting"] = ask
+            states[phone] = state
             save_json(STATE_FILE, states)
-            send_whatsapp(phone, next_question(key))
+            send_whatsapp(phone, next_question(ask))
             return jsonify(status="ask_slot")
-        st = slots
-
-    # responder pergunta de slot faltante
-    elif st.get("waiting"):
-        key = st.pop("waiting")
-        val = text if key!="urgente" else text.lower().startswith("s")
-        st[key] = val
-        miss = [k for k in ["item","qt","data","bairro","urgente"] if k not in st or not st[k]]
-        if miss:
-            nxt = miss[0]
-            st["waiting"] = nxt
-            states[phone] = st
+        # next: address if not sample
+        if state.get("obs")!="ver no carro" and not state.get("address"):
+            state["waiting"] = "address"
+            states[phone] = state
             save_json(STATE_FILE, states)
-            send_whatsapp(phone, next_question(nxt))
-            return jsonify(status="ask_slot")
-    else:
-        # erro de fluxo, reiniciar
-        states.pop(phone, None)
-        save_json(STATE_FILE, states)
-        send_whatsapp(phone, "Desculpe, vamos recomeçar. Qual produto deseja?")
-        return jsonify(status="reset")
-
-    # todos os dados prontos: confirmar com o cliente
-    customer = customers[phone]
-    summary  = f"Venda de {st['qt']}x {st['item']} para {st['data']} em {st['bairro']}"
-    if st.get("urgente"):
-        summary += " (URGENTE)"
-    msg_cli = f"Perfeito, {customer}! Confirma? {summary}\nResponda: sim/não"
-
-    # marca confirmação pendente
-    states[phone] = {"confirm_pending": True, "group_summary": summary}
+            send_whatsapp(phone, next_question("address"))
+            return jsonify(status="ask_address")
+    # 6) todos os dados coletados: confirmar venda
+    name    = customers[phone]
+    obs     = state.get("obs", f"Pedido {state['qt']}x {state['item']}")
+    summary = (
+        f"Dados da Cliente:\n"
+        f"Nome: {name}\n"
+        f"Whats: {phone}\n"
+        f"Endereço: {state.get('address')} - {state.get('bairro')}\n"
+        f"Data/Horário: {state.get('data')}\n"
+        f"Obs: {obs}"
+    )
+    send_whatsapp(phone, f"Perfeito, {name}! Confirmo o agendamento e já aviso quando estivermos a caminho. 😊")
+    # pendência de confirmar no grupo
+    state = {"confirm_pending":True, "group_summary":summary}
+    states[phone] = state
     save_json(STATE_FILE, states)
-    send_whatsapp(phone, msg_cli)
     return jsonify(status="ask_confirm")
 
 @app.route("/", methods=["GET"])
